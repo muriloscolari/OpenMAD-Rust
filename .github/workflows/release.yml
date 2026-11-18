@@ -16,6 +16,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install Linux system libraries
         run: |
@@ -49,6 +51,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Run tests & build release
         run: |
@@ -81,6 +85,7 @@ jobs:
     needs: [linux, windows]
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
@@ -90,6 +95,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ github.ref_name }}"
-          if [[ "$TAG" != v* ]]; then TAG="v0.1.0"; fi
-          gh release upload "$TAG" artifacts/* --clobber || \
-          gh release create "$TAG" artifacts/* --title "OpenMAD-Rust $TAG" --generate-notes
+          if [[ "$TAG" != v* ]]; then
+            VER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+            TAG="v${VER:-0.2.0}"
+          fi
+          gh release upload "$TAG" -R "${{ github.repository }}" artifacts/* --clobber || \
+          gh release create "$TAG" -R "${{ github.repository }}" artifacts/* --title "OpenMAD-Rust $TAG" --generate-notes

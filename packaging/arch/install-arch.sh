@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 VERSION="$(grep '^version =' "$ROOT_DIR/crates/openmad-ui/../openmad-core/../../Cargo.toml" 2>/dev/null || true)"
-PKGVER="0.1.0"
+PKGVER="0.1.1"
 
 echo "==> Building OpenMAD-Rust release binary..."
 cd "$ROOT_DIR"

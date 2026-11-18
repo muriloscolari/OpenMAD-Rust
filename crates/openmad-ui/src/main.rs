@@ -5,12 +5,16 @@ mod i18n;
 mod icon;
 mod theme;
 mod tray;
+mod ui;
 mod widgets;
 
 use app::OpenMadApp;
 use iced::Size;
 use icon::generate_app_icon_rgba;
-use theme::{app_theme, FONT_INTER, INTER_FONT_BYTES};
+use theme::{
+    app_theme, FONT_INTER, INTER_MEDIUM_BYTES, INTER_REGULAR_BYTES, INTER_SEMIBOLD_BYTES,
+    LUCIDE_FONT_BYTES,
+};
 
 pub fn load_window_icon() -> Option<iced::window::Icon> {
     let rgba = generate_app_icon_rgba(256);
@@ -120,7 +124,10 @@ fn main() -> iced::Result {
     install_linux_desktop_entry();
 
     iced::daemon(OpenMadApp::title, OpenMadApp::update, OpenMadApp::view)
-        .font(INTER_FONT_BYTES)
+        .font(INTER_REGULAR_BYTES)
+        .font(INTER_MEDIUM_BYTES)
+        .font(INTER_SEMIBOLD_BYTES)
+        .font(LUCIDE_FONT_BYTES)
         .default_font(FONT_INTER)
         .theme(|_, _| app_theme())
         .subscription(OpenMadApp::subscription)

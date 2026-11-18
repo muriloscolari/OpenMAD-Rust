@@ -1,49 +1,34 @@
-//! Main OpenMAD-Rust iced application with Apple Dark Mode styling and PT-BR/EN support.
+//! Main OpenMAD-Rust iced application state, command dispatch, and subscriptions.
 
 use crate::i18n::Lang;
-use crate::theme::{
-    badge_style, card_style, danger_button_style, elevated_card_style, input_style,
-    nav_button_style, pick_list_style, primary_button_style, secondary_button_style,
-    segmented_bar_style, sidebar_style, slider_style, swatch_button_style, tab_button_style,
-    toast_style, warn_banner_style, ACCENT_BLUE, AMBER_WARN, BG_BASE, FONT_INTER, GREEN_OK,
-    RED_DANGER, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
-};
+use crate::theme::dynamic_accent;
 use crate::tray::{TrayAction, TrayHandle};
-use crate::widgets::color_picker::{hsv_to_rgb, rgb_to_hsv, ColorPickerCanvas};
-use crate::widgets::gauge::TravelGaugeBar;
-use crate::widgets::keyboard::{BoardViewMode, KeyboardCanvas, KeyboardEvent};
-use iced::widget::{
-    button, column, container, pick_list, row, scrollable, slider, text, text_input, toggler,
-    Column, Row, Space,
-};
-use iced::{time, window, Alignment, Color, Element, Length, Subscription, Task};
+use crate::widgets::color_picker::{hsv_to_rgb, rgb_to_hsv};
+use crate::widgets::keyboard::KeyboardEvent;
+use iced::{time, window, Color, Element, Subscription, Task};
 use openmad_core::device::FullConfig;
 use openmad_core::features::{
     AdvancedKey, BoxLight, DeadBand, Dks, DksAction, KeyboardFeature, LightInfo, MacroStep,
     TapDance, LIGHT_EFFECTS,
 };
-use openmad_core::keycodes::{
-    self, KEYBOARD_PICKER_CODES, LAYER_PICKER_CODES, SYSTEM_PICKER_CODES,
-};
 use openmad_core::paths::{onboard_path, profile_dir, settings_path, switcher_config_path};
 use openmad_core::profile::{
     key_str, list_profiles, profile_path, write_onboard_name, Profile, RapidTriggerSpec,
-    TriggerBinding,
 };
-use openmad_core::protocol::{AdvancedKeyMode, BRIGHTNESS_MAX, FlashOp, KNOWN_PROTOCOL_VERSION};
+use openmad_core::protocol::{AdvancedKeyMode, BRIGHTNESS_MAX, FlashOp};
 use openmad_core::sampler::{DeviceCommand, SamplerHandle, Snapshot};
 use openmad_core::settings::{set_start_at_login, AppSettings};
 use openmad_core::switcher::{
-    list_windowed_processes, watcher_backend_name, Rule, SwitcherConfig, WindowedProcess,
+    list_windowed_processes, Rule, SwitcherConfig, WindowedProcess,
 };
 use openmad_core::updater::{
-    check_for_update, download_and_apply_update, UpdateInfo, APP_VERSION, REPO_SLUG,
+    check_for_update, download_and_apply_update, UpdateInfo, REPO_SLUG,
 };
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-const COLOR_PRESETS: &[(u8, u8, u8)] = &[
+pub const COLOR_PRESETS: &[(u8, u8, u8)] = &[
     (255, 255, 255),
     (255, 59, 48),
     (255, 149, 0),
@@ -56,39 +41,28 @@ const COLOR_PRESETS: &[(u8, u8, u8)] = &[
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SidebarView {
-    Equipment,
-    Macros,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum EquipTab {
-    ChangeKey,
+pub enum NavSection {
+    Keys,
     Lighting,
     Performance,
-    AdvancedKey,
+    Advanced,
+    Macros,
     AppTrigger,
-    OtherSettings,
+    System,
+    Settings,
 }
 
-impl EquipTab {
-    const ALL: [Self; 6] = [
-        Self::ChangeKey,
-        Self::Lighting,
-        Self::Performance,
-        Self::AdvancedKey,
-        Self::AppTrigger,
-        Self::OtherSettings,
-    ];
-
-    fn title(self, lang: Lang) -> &'static str {
+impl NavSection {
+    pub fn title(self, lang: Lang) -> &'static str {
         match self {
-            Self::ChangeKey => lang.t("Remapear Teclas", "Keymap"),
+            Self::Keys => lang.t("Remapear Teclas", "Keymap"),
             Self::Lighting => lang.t("Iluminação", "Lighting"),
             Self::Performance => lang.t("Performance", "Performance"),
-            Self::AdvancedKey => lang.t("Teclas Avançadas", "Advanced Key"),
+            Self::Advanced => lang.t("Teclas Avançadas", "Advanced Key"),
+            Self::Macros => "Macros",
             Self::AppTrigger => lang.t("Troca por App", "App Trigger"),
-            Self::OtherSettings => lang.t("Sistema & Flash", "Other Settings"),
+            Self::System => lang.t("Sistema & Flash", "System & Flash"),
+            Self::Settings => lang.t("Configurações", "Settings"),
         }
     }
 }
@@ -127,8 +101,19 @@ pub enum Message {
     DismissToast,
     ToggleLanguage,
     SelectLanguage(String),
-    SelectView(SidebarView),
-    SelectEquipTab(EquipTab),
+    SelectSection(NavSection),
+    ToggleKeyboardCollapsed,
+    ToggleProfileMenu,
+    ToggleSaveMenu,
+    CloseMenus,
+    ToggleLightingRgb,
+    KeycodeSearchChanged(String),
+    ApplyPerfPreset {
+        actuation: f32,
+        rt: bool,
+        press: f32,
+        release: f32,
+    },
     SelectPerfSubTab(PerfSubTab),
     SelectKeyPickerTab(KeyPickerTab),
     SelectAdvSubTab(AdvSubTab),
@@ -237,8 +222,7 @@ pub enum Message {
     SaveMacroSlot,
     ClearMacroSlot,
 
-    // Settings Modal
-    ToggleSettingsModal(bool),
+    // Settings
     CheckUpdates,
     InstallUpdate,
     GainRChanged(f32),
@@ -253,69 +237,72 @@ pub enum Message {
 }
 
 pub struct OpenMadApp {
-    sampler: SamplerHandle,
-    tray: Option<TrayHandle>,
-    snap: Snapshot,
-    window_id: Option<window::Id>,
+    pub(crate) sampler: SamplerHandle,
+    pub(crate) tray: Option<TrayHandle>,
+    pub(crate) snap: Snapshot,
+    pub(crate) window_id: Option<window::Id>,
 
-    lang: Lang,
-    view: SidebarView,
-    equip_tab: EquipTab,
-    perf_sub: PerfSubTab,
-    pick_tab: KeyPickerTab,
-    adv_sub: AdvSubTab,
-    layer: usize,
-    selected_keys: BTreeSet<usize>,
+    pub(crate) lang: Lang,
+    pub(crate) section: NavSection,
+    pub(crate) perf_sub: PerfSubTab,
+    pub(crate) pick_tab: KeyPickerTab,
+    pub(crate) adv_sub: AdvSubTab,
+    pub(crate) layer: usize,
+    pub(crate) selected_keys: BTreeSet<usize>,
+    pub(crate) keyboard_collapsed: bool,
+    pub(crate) profile_menu_open: bool,
+    pub(crate) save_menu_open: bool,
+    pub(crate) lighting_advanced_rgb: bool,
+    pub(crate) keycode_search: String,
 
-    profiles: Vec<String>,
-    selected_profile: Option<String>,
-    new_profile_name: String,
+    pub(crate) profiles: Vec<String>,
+    pub(crate) selected_profile: Option<String>,
+    pub(crate) new_profile_name: String,
 
-    light_draft: LightInfo,
-    light_hue: f32,
-    light_sat: f32,
-    light_val: f32,
-    light_hex: String,
-    box_draft: BoxLight,
+    pub(crate) light_draft: LightInfo,
+    pub(crate) light_hue: f32,
+    pub(crate) light_sat: f32,
+    pub(crate) light_val: f32,
+    pub(crate) light_hex: String,
+    pub(crate) box_draft: BoxLight,
 
-    actuation_mm: f32,
-    rt_enabled: bool,
-    rt_press_mm: f32,
-    rt_release_mm: f32,
-    dead_top_mm: f32,
-    dead_bot_mm: f32,
+    pub(crate) actuation_mm: f32,
+    pub(crate) rt_enabled: bool,
+    pub(crate) rt_press_mm: f32,
+    pub(crate) rt_release_mm: f32,
+    pub(crate) dead_top_mm: f32,
+    pub(crate) dead_bot_mm: f32,
 
-    adv_slot: usize,
-    adv_k1_r: String,
-    adv_k1_c: String,
-    adv_k2_r: String,
-    adv_k2_c: String,
-    adv_apc: f32,
-    adv_rt: bool,
-    mt_tap: String,
-    mt_hold: String,
-    mt_timer: String,
-    dks_draft: Dks,
+    pub(crate) adv_slot: usize,
+    pub(crate) adv_k1_r: String,
+    pub(crate) adv_k1_c: String,
+    pub(crate) adv_k2_r: String,
+    pub(crate) adv_k2_c: String,
+    pub(crate) adv_apc: f32,
+    pub(crate) adv_rt: bool,
+    pub(crate) mt_tap: String,
+    pub(crate) mt_hold: String,
+    pub(crate) mt_timer: String,
+    pub(crate) dks_draft: Dks,
 
-    switcher_cfg: SwitcherConfig,
-    trigger_exe: String,
-    trigger_title: String,
-    processes: Vec<WindowedProcess>,
+    pub(crate) switcher_cfg: SwitcherConfig,
+    pub(crate) trigger_exe: String,
+    pub(crate) trigger_title: String,
+    pub(crate) processes: Vec<WindowedProcess>,
 
-    macro_slot: usize,
-    macro_steps: Vec<MacroStep>,
-    macro_step_kind: String,
-    macro_step_val: String,
+    pub(crate) macro_slot: usize,
+    pub(crate) macro_steps: Vec<MacroStep>,
+    pub(crate) macro_step_kind: String,
+    pub(crate) macro_step_val: String,
 
-    factory_confirm: String,
-    show_settings: bool,
-    settings: AppSettings,
-    update_info: Option<Result<UpdateInfo, String>>,
-    pending_update: Arc<Mutex<Option<Result<UpdateInfo, String>>>>,
-    toast: Option<(String, bool, u8)>,
-    synced_initial: bool,
-    screenshot_target: Option<String>,
-    screenshot_ticks: u32,
+    pub(crate) factory_confirm: String,
+    pub(crate) settings: AppSettings,
+    pub(crate) update_info: Option<Result<UpdateInfo, String>>,
+    pub(crate) pending_update: Arc<Mutex<Option<Result<UpdateInfo, String>>>>,
+    pub(crate) toast: Option<(String, bool, u8)>,
+    pub(crate) synced_initial: bool,
+    pub(crate) screenshot_target: Option<String>,
+    pub(crate) screenshot_ticks: u32,
 }
 
 impl OpenMadApp {
@@ -357,13 +344,17 @@ impl OpenMadApp {
             snap,
             window_id,
             lang,
-            view: SidebarView::Equipment,
-            equip_tab: EquipTab::Performance,
+            section: NavSection::Performance,
             perf_sub: PerfSubTab::Travel,
             pick_tab: KeyPickerTab::Keyboard,
             adv_sub: AdvSubTab::RappySnappy,
             layer: 0,
             selected_keys: BTreeSet::new(),
+            keyboard_collapsed: false,
+            profile_menu_open: false,
+            save_menu_open: false,
+            lighting_advanced_rgb: false,
+            keycode_search: String::new(),
             profiles,
             selected_profile,
             new_profile_name: String::new(),
@@ -406,7 +397,6 @@ impl OpenMadApp {
             macro_step_kind: "tap".into(),
             macro_step_val: "0x0004".into(),
             factory_confirm: String::new(),
-            show_settings: false,
             settings,
             update_info: None,
             pending_update,
@@ -668,28 +658,20 @@ impl OpenMadApp {
                     self.lang = Lang::Pt;
                     match target.as_str() {
                         "lighting" => {
-                            self.show_settings = false;
-                            self.view = SidebarView::Equipment;
-                            self.equip_tab = EquipTab::Lighting;
+                            self.section = NavSection::Lighting;
                         }
                         "performance" => {
-                            self.show_settings = false;
-                            self.view = SidebarView::Equipment;
-                            self.equip_tab = EquipTab::Performance;
+                            self.section = NavSection::Performance;
                             self.perf_sub = PerfSubTab::Travel;
                         }
                         "app-trigger" => {
-                            self.show_settings = false;
-                            self.view = SidebarView::Equipment;
-                            self.equip_tab = EquipTab::AppTrigger;
+                            self.section = NavSection::AppTrigger;
                         }
                         "remap" => {
-                            self.show_settings = false;
-                            self.view = SidebarView::Equipment;
-                            self.equip_tab = EquipTab::ChangeKey;
+                            self.section = NavSection::Keys;
                         }
                         "settings" => {
-                            self.show_settings = true;
+                            self.section = NavSection::Settings;
                         }
                         _ => {}
                     }
@@ -765,15 +747,56 @@ impl OpenMadApp {
                 };
                 self.save_language(next);
             }
-            Message::SelectView(v) => {
-                self.show_settings = false;
-                self.view = v;
-            }
-            Message::SelectEquipTab(t) => {
-                self.equip_tab = t;
-                if t == EquipTab::AppTrigger && self.processes.is_empty() {
+            Message::SelectSection(sec) => {
+                self.section = sec;
+                self.profile_menu_open = false;
+                self.save_menu_open = false;
+                if sec == NavSection::AppTrigger && self.processes.is_empty() {
                     self.processes = list_windowed_processes();
                 }
+            }
+            Message::ToggleKeyboardCollapsed => {
+                self.keyboard_collapsed = !self.keyboard_collapsed;
+            }
+            Message::ToggleProfileMenu => {
+                self.profile_menu_open = !self.profile_menu_open;
+                self.save_menu_open = false;
+            }
+            Message::ToggleSaveMenu => {
+                self.save_menu_open = !self.save_menu_open;
+                self.profile_menu_open = false;
+            }
+            Message::CloseMenus => {
+                self.profile_menu_open = false;
+                self.save_menu_open = false;
+            }
+            Message::ToggleLightingRgb => {
+                self.lighting_advanced_rgb = !self.lighting_advanced_rgb;
+            }
+            Message::KeycodeSearchChanged(q) => {
+                self.keycode_search = q;
+            }
+            Message::ApplyPerfPreset {
+                actuation,
+                rt,
+                press,
+                release,
+            } => {
+                self.actuation_mm = actuation;
+                self.rt_enabled = rt;
+                self.rt_press_mm = press;
+                self.rt_release_mm = release;
+                let indices = self.target_indices();
+                self.sampler.send(DeviceCommand::SetActuation {
+                    indices: indices.clone(),
+                    mm: actuation,
+                });
+                self.sampler.send(DeviceCommand::SetRapidTrigger {
+                    indices,
+                    enabled: rt,
+                    press_mm: press,
+                    release_mm: release,
+                });
             }
             Message::SelectPerfSubTab(s) => self.perf_sub = s,
             Message::SelectKeyPickerTab(p) => self.pick_tab = p,
@@ -876,6 +899,8 @@ impl OpenMadApp {
                 }
             }
             Message::SaveCurrentProfile => {
+                self.save_menu_open = false;
+                self.profile_menu_open = false;
                 self.save_current_profile();
             }
             Message::RenameProfile => {
@@ -1380,7 +1405,10 @@ impl OpenMadApp {
                 self.sampler
                     .send(DeviceCommand::UnlockBoard(self.snap.board.product_id));
             }
-            Message::CommitToFlash => self.sampler.send(DeviceCommand::CommitToFlash),
+            Message::CommitToFlash => {
+                self.save_menu_open = false;
+                self.sampler.send(DeviceCommand::CommitToFlash);
+            }
             Message::ExportBackup => {
                 if let Some(path) = rfd::FileDialog::new()
                     .set_file_name("openmad-backup.json")
@@ -1472,8 +1500,7 @@ impl OpenMadApp {
                 });
             }
 
-            // Settings Modal — immediate gain dispatch!
-            Message::ToggleSettingsModal(v) => self.show_settings = v,
+            // Settings — immediate gain dispatch!
             Message::CheckUpdates => {
                 let slot = Arc::clone(&self.pending_update);
                 std::thread::spawn(move || {
@@ -1567,1843 +1594,44 @@ impl OpenMadApp {
         self.sampler.send(DeviceCommand::SetLight(self.light_draft));
     }
 
+    pub fn accent(&self) -> Color {
+        dynamic_accent([self.light_draft.r, self.light_draft.g, self.light_draft.b])
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        let Some(ref cfg) = self.snap.config else {
+            return false;
+        };
+        if cfg.light != self.light_draft || cfg.box_light != self.box_draft {
+            return true;
+        }
+        if (cfg.dead_band.top_mm - self.dead_top_mm).abs() > 0.01
+            || (cfg.dead_band.bottom_mm - self.dead_bot_mm).abs() > 0.01
+        {
+            return true;
+        }
+        if let Some(&act) = cfg.actuation.first() {
+            if (act - self.actuation_mm).abs() > 0.01 {
+                return true;
+            }
+        }
+        if let Some(rt) = cfg.rapid_trigger.first() {
+            if rt.enabled != self.rt_enabled
+                || (rt.press_mm - self.rt_press_mm).abs() > 0.01
+                || (rt.release_mm - self.rt_release_mm).abs() > 0.01
+            {
+                return true;
+            }
+        }
+        false
+    }
+
     pub fn view(&self, _window: window::Id) -> Element<'_, Message> {
-        let sidebar = self.view_sidebar();
-        let main_area = if self.show_settings {
-            self.view_settings()
-        } else {
-            self.view_main()
-        };
-
-        let root = row![sidebar, main_area]
-            .width(Length::Fill)
-            .height(Length::Fill);
-
-        container(root)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .style(|_| iced::widget::container::Style {
-                background: Some(iced::Background::Color(BG_BASE)),
-                ..Default::default()
-            })
-            .into()
-    }
-
-    fn view_sidebar(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let header = row![
-            column![
-                text("OpenMAD").size(20).font(FONT_INTER).color(TEXT_PRIMARY),
-                text(format!("Rust Edition · v{APP_VERSION}"))
-                    .size(11)
-                    .color(TEXT_MUTED),
-            ]
-            .spacing(2),
-            Space::with_width(Length::Fill),
-            button(text(if l.is_pt() { "PT" } else { "EN" }).size(11))
-                .padding([4, 9])
-                .style(secondary_button_style)
-                .on_press(Message::ToggleLanguage),
-        ]
-        .align_y(Alignment::Center);
-
-        let nav = column![
-            button(text(l.t("Equipamento", "Equipment")).size(13))
-                .width(Length::Fill)
-                .padding([9, 12])
-                .style(nav_button_style(
-                    self.view == SidebarView::Equipment && !self.show_settings
-                ))
-                .on_press(Message::SelectView(SidebarView::Equipment)),
-            button(text("Macros").size(13))
-                .width(Length::Fill)
-                .padding([9, 12])
-                .style(nav_button_style(
-                    self.view == SidebarView::Macros && !self.show_settings
-                ))
-                .on_press(Message::SelectView(SidebarView::Macros)),
-            button(text(l.t("Firmware ↗", "Firmware ↗")).size(13))
-                .width(Length::Fill)
-                .padding([9, 12])
-                .style(nav_button_style(false))
-                .on_press(Message::OpenFirmwareUrl),
-        ]
-        .spacing(4);
-
-        let prof_controls = row![
-            text(l.t("PERFIS", "PROFILES")).size(10).color(TEXT_MUTED),
-            Space::with_width(Length::Fill),
-            button(text(l.t("Importar", "Import")).size(11))
-                .padding([3, 7])
-                .style(secondary_button_style)
-                .on_press(Message::ImportProfile),
-            button(text("Flash").size(11))
-                .padding([3, 7])
-                .style(secondary_button_style)
-                .on_press(Message::SaveProfileOnboard),
-        ]
-        .align_y(Alignment::Center);
-
-        let new_prof_row = row![
-            text_input(l.t("Nome do perfil…", "Profile name…"), &self.new_profile_name)
-                .on_input(Message::NewProfileNameChanged)
-                .padding([6, 9])
-                .size(12)
-                .style(input_style),
-            button(text("+").size(13))
-                .padding([5, 11])
-                .style(primary_button_style)
-                .on_press(Message::CreateProfile(false)),
-        ]
-        .spacing(6);
-
-        let mut plist = Column::new().spacing(3);
-        for name in &self.profiles {
-            let active = self.selected_profile.as_deref() == Some(name.as_str());
-            let is_onboard = self.snap.onboard_profile.as_deref() == Some(name.as_str());
-            let label = if is_onboard {
-                format!("{name}  ●")
-            } else {
-                name.clone()
-            };
-            plist = plist.push(
-                button(text(label).size(12))
-                    .width(Length::Fill)
-                    .padding([7, 10])
-                    .style(nav_button_style(active))
-                    .on_press(Message::SelectProfile(name.clone())),
-            );
-        }
-
-        let prof_actions = column![
-            button(
-                text(
-                    self.selected_profile
-                        .as_deref()
-                        .map(|n| format!("{} ({n})", l.t("Salvar no Perfil", "Save to Profile")))
-                        .unwrap_or_else(|| l.t("Salvar no Perfil", "Save to Profile").to_string())
-                )
-                .size(11)
-            )
-            .width(Length::Fill)
-            .padding([6, 10])
-            .style(primary_button_style)
-            .on_press(Message::SaveCurrentProfile),
-            row![
-                button(text(l.t("Exp", "Exp")).size(11))
-                    .padding([4, 8])
-                    .style(secondary_button_style)
-                    .on_press(Message::ExportProfile),
-                button(text("Dup").size(11))
-                    .padding([4, 8])
-                    .style(secondary_button_style)
-                    .on_press(Message::DuplicateProfile),
-                button(text(l.t("Ren", "Ren")).size(11))
-                    .padding([4, 8])
-                    .style(secondary_button_style)
-                    .on_press(Message::RenameProfile),
-                button(text(l.t("Del", "Del")).size(11))
-                    .padding([4, 8])
-                    .style(danger_button_style)
-                    .on_press(Message::DeleteProfile),
-            ]
-            .spacing(4),
-        ]
-        .spacing(6);
-
-        let status_color = if self.snap.connected {
-            if self.snap.read_only {
-                AMBER_WARN
-            } else {
-                GREEN_OK
-            }
-        } else {
-            RED_DANGER
-        };
-        let status_label = if self.snap.connected {
-            if self.snap.read_only {
-                format!("● {} ({})", self.snap.board.name, l.t("Leitura", "Read-Only"))
-            } else {
-                format!("● {}", self.snap.board.name)
-            }
-        } else if self.snap.in_bootloader {
-            l.t("● Modo Bootloader", "● Bootloader Mode").to_string()
-        } else {
-            l.t("● Desconectado", "● Disconnected").to_string()
-        };
-
-        let status_badge = container(text(status_label).size(11).color(status_color))
-            .width(Length::Fill)
-            .padding([6, 10])
-            .style(badge_style(status_color));
-
-        let footer = column![
-            status_badge,
-            row![
-                button(text(l.t("⚙  Configurações", "⚙  Settings")).size(12))
-                    .width(Length::Fill)
-                    .padding([8, 10])
-                    .style(nav_button_style(self.show_settings))
-                    .on_press(Message::ToggleSettingsModal(!self.show_settings)),
-                button(text(l.t("Bandeja", "Tray")).size(12))
-                    .padding([8, 10])
-                    .style(secondary_button_style)
-                    .on_press(Message::HideToTray),
-            ]
-            .spacing(6),
-        ]
-        .spacing(8);
-
-        let content = column![
-            header,
-            nav,
-            prof_controls,
-            new_prof_row,
-            scrollable(plist).height(Length::Fill),
-            prof_actions,
-            footer,
-        ]
-        .spacing(12)
-        .padding(16);
-
-        container(content)
-            .width(Length::Fixed(252.0))
-            .height(Length::Fill)
-            .style(sidebar_style)
-            .into()
-    }
-
-    fn view_main(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let mut col = Column::new().spacing(14).padding(20);
-
-        if !self.snap.connected {
-            if let Some(ref err) = self.snap.error {
-                col = col.push(
-                    container(text(err).size(12).color(AMBER_WARN))
-                        .width(Length::Fill)
-                        .padding([8, 12])
-                        .style(warn_banner_style),
-                );
-            }
-        }
-        if self.snap.connected && !self.snap.firmware_verified {
-            let pv = self.snap.protocol_version.unwrap_or(0);
-            col = col.push(
-                container(
-                    text(format!(
-                        "{} v{pv} != v{KNOWN_PROTOCOL_VERSION}. {}",
-                        l.t("Aviso: Protocolo do firmware", "Warning: Firmware protocol"),
-                        l.t(
-                            "Faça um backup antes de gravar.",
-                            "Take a backup before writing."
-                        )
-                    ))
-                    .size(12)
-                    .color(AMBER_WARN),
-                )
-                .width(Length::Fill)
-                .padding([8, 12])
-                .style(warn_banner_style),
-            );
-        }
-        if self.snap.connected && self.snap.read_only {
-            col = col.push(
-                container(
-                    row![
-                        text(
-                            self.snap
-                                .read_only_reason
-                                .as_deref()
-                                .unwrap_or(l.t("Placa em modo somente leitura", "Board opened read-only"))
-                        )
-                        .size(12)
-                        .color(AMBER_WARN),
-                        Space::with_width(Length::Fill),
-                        button(text(l.t("Desbloquear Escrita", "Unlock Writes")).size(12))
-                            .padding([4, 10])
-                            .style(secondary_button_style)
-                            .on_press(Message::UnlockBoard),
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding([8, 12])
-                .style(warn_banner_style),
-            );
-        }
-
-        if let Some((ref msg, is_err, _)) = self.toast {
-            col = col.push(
-                container(
-                    row![
-                        text(msg)
-                            .size(12)
-                            .color(if is_err { RED_DANGER } else { GREEN_OK }),
-                        Space::with_width(Length::Fill),
-                        button(text("✕").size(11))
-                            .padding([2, 6])
-                            .style(secondary_button_style)
-                            .on_press(Message::DismissToast),
-                    ]
-                    .align_y(Alignment::Center),
-                )
-                .width(Length::Fill)
-                .padding([8, 12])
-                .style(toast_style(is_err)),
-            );
-        }
-
-        match self.view {
-            SidebarView::Equipment => {
-                let mut tabs = Row::new().spacing(4);
-                for t in EquipTab::ALL {
-                    tabs = tabs.push(
-                        button(text(t.title(l)).size(12))
-                            .padding([7, 13])
-                            .style(tab_button_style(self.equip_tab == t))
-                            .on_press(Message::SelectEquipTab(t)),
-                    );
-                }
-                let mut bar_row = Row::new().spacing(10).align_y(Alignment::Center);
-                bar_row = bar_row.push(
-                    container(tabs)
-                        .padding(4)
-                        .style(segmented_bar_style),
-                );
-                if self.selected_profile.is_some() {
-                    bar_row = bar_row.push(Space::with_width(Length::Fill));
-                    bar_row = bar_row.push(
-                        button(text(l.t("Salvar no Perfil", "Save to Profile")).size(12))
-                            .padding([7, 13])
-                            .style(primary_button_style)
-                            .on_press(Message::SaveCurrentProfile),
-                    );
-                }
-                col = col.push(bar_row);
-
-                if matches!(
-                    self.equip_tab,
-                    EquipTab::ChangeKey
-                        | EquipTab::Lighting
-                        | EquipTab::Performance
-                        | EquipTab::AdvancedKey
-                ) {
-                    let mode = match self.equip_tab {
-                        EquipTab::Lighting => BoardViewMode::Lighting,
-                        EquipTab::Performance => BoardViewMode::Performance,
-                        EquipTab::AdvancedKey => BoardViewMode::Advanced,
-                        _ => BoardViewMode::Keymap,
-                    };
-                    let cfg_ref = self.snap.config.as_ref();
-                    let kb = KeyboardCanvas {
-                        rows: self.snap.board.rows,
-                        cols: self.snap.board.cols,
-                        populated: &self.snap.populated,
-                        selected: &self.selected_keys,
-                        mode,
-                        layer: self.layer,
-                        keymap: cfg_ref.map(|c| c.keymap.as_slice()).unwrap_or(&[]),
-                        actuation: cfg_ref.map(|c| c.actuation.as_slice()).unwrap_or(&[]),
-                        trip_mm: &self.snap.trip_mm,
-                        key_colors: cfg_ref.map(|c| c.key_colors.as_slice()).unwrap_or(&[]),
-                        light_effect: self.light_draft.effect,
-                        light_color: [self.light_draft.r, self.light_draft.g, self.light_draft.b],
-                    };
-                    col = col.push(kb.view(Message::Keyboard));
-
-                    let sel_hint = if self.selected_keys.is_empty() {
-                        l.t(
-                            "Nenhuma tecla selecionada (ajustes aplicam em todo o teclado)",
-                            "0 keys selected (edits apply to the whole keyboard)",
-                        )
-                        .to_string()
-                    } else {
-                        format!(
-                            "{} {}",
-                            self.selected_keys.len(),
-                            l.t("tecla(s) selecionada(s)", "key(s) selected")
-                        )
-                    };
-
-                    let sel_bar = row![
-                        text(sel_hint).size(12).color(TEXT_SECONDARY),
-                        Space::with_width(Length::Fill),
-                        button(text(l.t("Selecionar Todas", "Select All")).size(11))
-                            .padding([4, 10])
-                            .style(secondary_button_style)
-                            .on_press(Message::SelectAllKeys),
-                        button(text(l.t("Limpar", "Clear")).size(11))
-                            .padding([4, 10])
-                            .style(secondary_button_style)
-                            .on_press(Message::SelectNoKeys),
-                        button(text(l.t("Inverter", "Invert")).size(11))
-                            .padding([4, 10])
-                            .style(secondary_button_style)
-                            .on_press(Message::InvertKeys),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center);
-                    col = col.push(sel_bar);
-                }
-
-                let tab_body = match self.equip_tab {
-                    EquipTab::ChangeKey => self.view_change_key(),
-                    EquipTab::Lighting => self.view_lighting(),
-                    EquipTab::Performance => self.view_performance(),
-                    EquipTab::AdvancedKey => self.view_advanced_key(),
-                    EquipTab::AppTrigger => self.view_app_trigger(),
-                    EquipTab::OtherSettings => self.view_other_settings(),
-                };
-                col = col.push(scrollable(tab_body).height(Length::Fill));
-            }
-            SidebarView::Macros => {
-                col = col.push(scrollable(self.view_macros()).height(Length::Fill));
-            }
-        }
-
-        col.width(Length::Fill).height(Length::Fill).into()
-    }
-
-    fn view_change_key(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let mut layer_row = Row::new().spacing(6).align_y(Alignment::Center);
-        layer_row = layer_row.push(text(l.t("Camada:", "Layer:")).size(12).color(TEXT_SECONDARY));
-        for idx in 0..4 {
-            layer_row = layer_row.push(
-                button(text(format!("L{idx}")).size(12))
-                    .padding([5, 12])
-                    .style(tab_button_style(self.layer == idx))
-                    .on_press(Message::SelectLayer(idx)),
-            );
-        }
-        layer_row = layer_row.push(Space::with_width(Length::Fill));
-        layer_row = layer_row.push(
-            button(text(l.t("Aplicar Keymap Completo (EEPROM)", "Apply Full Keymap (EEPROM)")).size(12))
-                .padding([6, 12])
-                .style(primary_button_style)
-                .on_press(Message::ApplyFullKeymap),
-        );
-
-        let pick_tabs = row![
-            button(text(l.t("Teclas Padrão", "Keyboard Key")).size(12))
-                .padding([5, 10])
-                .style(tab_button_style(self.pick_tab == KeyPickerTab::Keyboard))
-                .on_press(Message::SelectKeyPickerTab(KeyPickerTab::Keyboard)),
-            button(text(l.t("Sistema / Mídia", "System / Media")).size(12))
-                .padding([5, 10])
-                .style(tab_button_style(self.pick_tab == KeyPickerTab::System))
-                .on_press(Message::SelectKeyPickerTab(KeyPickerTab::System)),
-            button(text("Macros").size(12))
-                .padding([5, 10])
-                .style(tab_button_style(self.pick_tab == KeyPickerTab::Macro))
-                .on_press(Message::SelectKeyPickerTab(KeyPickerTab::Macro)),
-            button(text(l.t("Camadas (Fn)", "Layer / Special")).size(12))
-                .padding([5, 10])
-                .style(tab_button_style(self.pick_tab == KeyPickerTab::Layer))
-                .on_press(Message::SelectKeyPickerTab(KeyPickerTab::Layer)),
-        ]
-        .spacing(6);
-
-        let codes: Vec<(u16, String)> = match self.pick_tab {
-            KeyPickerTab::Keyboard => KEYBOARD_PICKER_CODES
-                .iter()
-                .map(|&(k, lbl)| (k, lbl.to_string()))
-                .collect(),
-            KeyPickerTab::System => SYSTEM_PICKER_CODES
-                .iter()
-                .map(|&(k, lbl)| (k, lbl.to_string()))
-                .collect(),
-            KeyPickerTab::Macro => (0..16u16).map(|i| (0x7700 + i, format!("M{i}"))).collect(),
-            KeyPickerTab::Layer => LAYER_PICKER_CODES
-                .iter()
-                .map(|&(k, lbl)| (k, lbl.to_string()))
-                .collect(),
-        };
-
-        let mut grid = Column::new().spacing(6);
-        for chunk in codes.chunks(10) {
-            let mut r = Row::new().spacing(6);
-            for (kc, label) in chunk {
-                r = r.push(
-                    button(text(label.clone()).size(11))
-                        .padding([6, 10])
-                        .style(secondary_button_style)
-                        .on_press(Message::AssignKeycode(*kc)),
-                );
-            }
-            grid = grid.push(r);
-        }
-
-        container(
-            column![
-                layer_row,
-                text(l.t(
-                    "Clique em uma tecla do teclado acima e escolha a nova função abaixo. Alterações de keymap são gravadas diretamente na EEPROM.",
-                    "Click a key on the keyboard above, then pick its new keycode below (writes to EEPROM)."
-                ))
-                .size(12)
-                .color(TEXT_MUTED),
-                pick_tabs,
-                grid,
-            ]
-            .spacing(12)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style)
-        .into()
-    }
-
-    fn view_lighting(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let pt = l.is_pt();
-        let effect_names: Vec<String> = LIGHT_EFFECTS
-            .iter()
-            .map(|e| format!("{:02} · {}", e.id, e.label(pt)))
-            .collect();
-        let cur_meta = LIGHT_EFFECTS.iter().find(|e| e.id == self.light_draft.effect);
-        let current_eff = cur_meta.map(|e| format!("{:02} · {}", e.id, e.label(pt)));
-        let has_color = cur_meta.map_or(true, |e| e.has_color);
-        let has_speed = cur_meta.map_or(true, |e| e.has_speed);
-
-        let eff_picker = pick_list(effect_names, current_eff, |sel| {
-            let id = sel
-                .split('·')
-                .next()
-                .and_then(|s| s.trim().parse::<u8>().ok())
-                .unwrap_or(13);
-            Message::LightEffectSelected(id)
-        })
-        .style(pick_list_style)
-        .padding([6, 10]);
-
-        let swatch = container(Space::with_width(Length::Fixed(34.0)).height(Length::Fixed(34.0)))
-            .style(|_| iced::widget::container::Style {
-                background: Some(iced::Background::Color(Color::from_rgb8(
-                    self.light_draft.r,
-                    self.light_draft.g,
-                    self.light_draft.b,
-                ))),
-                border: iced::Border {
-                    color: TEXT_SECONDARY,
-                    width: 1.2,
-                    radius: 8.0.into(),
-                },
-                ..Default::default()
-            });
-
-        let mut presets = Row::new().spacing(8).align_y(Alignment::Center);
-        for &(r, g, b) in COLOR_PRESETS {
-            presets = presets.push(
-                button(Space::with_width(Length::Fixed(20.0)).height(Length::Fixed(20.0)))
-                    .padding(0)
-                    .style(swatch_button_style(Color::from_rgb8(r, g, b)))
-                    .on_press(Message::LightColorPreset(r, g, b)),
-            );
-        }
-
-        let effect_hint = if !has_color {
-            l.t(
-                "Efeito com cores automáticas — ao clicar em uma cor abaixo, muda automaticamente para Cor Fixa.",
-                "Auto-spectrum effect — clicking any color below automatically switches to Constant Color.",
-            )
-        } else if self.light_draft.effect == 1 {
-            l.t(
-                "Modo Personalizado ativo: clicar em qualquer cor pinta imediatamente as teclas selecionadas.",
-                "Customization mode active: clicking any color immediately paints the selected keys.",
-            )
-        } else {
-            l.t(
-                "Clique ou arraste no seletor de cor para mudar a cor do teclado ao vivo.",
-                "Click or drag in the color picker to change keyboard color live.",
-            )
-        };
-
-        let hsv_picker = ColorPickerCanvas {
-            hue: self.light_hue,
-            sat: self.light_sat,
-            val: self.light_val,
-        }
-        .view(Message::LightHsvChanged);
-
-        let color_controls = column![
-            row![
-                swatch,
-                column![
-                    text(l.t("Código HEX", "HEX Code")).size(10).color(TEXT_MUTED),
-                    text_input("#0A84FF", &self.light_hex)
-                        .on_input(Message::LightHexChanged)
-                        .width(Length::Fixed(104.0))
-                        .padding([5, 8])
-                        .size(12)
-                        .style(input_style),
-                ]
-                .spacing(2),
-                Space::with_width(Length::Fixed(8.0)),
-                column![
-                    text(l.t("Cores rápidas", "Presets")).size(10).color(TEXT_MUTED),
-                    presets,
-                ]
-                .spacing(4),
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            slider_row(
-                format!("{} ({})", l.t("Vermelho", "Red"), self.light_draft.r),
-                0.0..=255.0,
-                self.light_draft.r as f32,
-                1.0,
-                |v| Message::LightRChanged(v as u8),
-            ),
-            slider_row(
-                format!("{} ({})", l.t("Verde", "Green"), self.light_draft.g),
-                0.0..=255.0,
-                self.light_draft.g as f32,
-                1.0,
-                |v| Message::LightGChanged(v as u8),
-            ),
-            slider_row(
-                format!("{} ({})", l.t("Azul", "Blue"), self.light_draft.b),
-                0.0..=255.0,
-                self.light_draft.b as f32,
-                1.0,
-                |v| Message::LightBChanged(v as u8),
-            ),
-        ]
-        .spacing(10)
-        .width(Length::Fill);
-
-        let mut main_col = column![
-            row![
-                column![
-                    text(l.t("Iluminação Global", "Global Lighting")).size(15).color(TEXT_PRIMARY),
-                    text(effect_hint).size(12).color(TEXT_MUTED),
-                ]
-                .spacing(3),
-                Space::with_width(Length::Fill),
-                button(text(l.t("Pintar Teclas", "Paint Keys")).size(12))
-                    .padding([6, 12])
-                    .style(secondary_button_style)
-                    .on_press(Message::PaintSelectedKeys),
-                button(text(l.t("Salvar na Flash", "Save to Flash")).size(12))
-                    .padding([6, 12])
-                    .style(primary_button_style)
-                    .on_press(Message::SaveLighting),
-            ]
-            .spacing(8)
-            .align_y(Alignment::Center),
-            row![
-                text(l.t("Efeito:", "Effect:")).size(12).color(TEXT_SECONDARY),
-                eff_picker
-            ]
-            .spacing(10)
-            .align_y(Alignment::Center),
-            slider_row(
-                format!(
-                    "{} ({}/{BRIGHTNESS_MAX})",
-                    l.t("Brilho", "Brightness"),
-                    self.light_draft.brightness
-                ),
-                0.0..=(BRIGHTNESS_MAX as f32),
-                self.light_draft.brightness as f32,
-                1.0,
-                |v| Message::LightBrightnessChanged(v as u8),
-            ),
-        ]
-        .spacing(11)
-        .padding(18);
-
-        if has_speed {
-            main_col = main_col.push(slider_row(
-                format!("{} ({})", l.t("Velocidade", "Speed"), self.light_draft.speed),
-                1.0..=255.0,
-                self.light_draft.speed.max(1) as f32,
-                1.0,
-                |v| Message::LightSpeedChanged(v as u8),
-            ));
-        }
-
-        main_col = main_col.push(
-            row![hsv_picker, color_controls]
-                .spacing(18)
-                .align_y(Alignment::Center),
-        );
-
-        let main_card = container(main_col).width(Length::Fill).style(card_style);
-
-        let box_card = container(
-            column![
-                column![
-                    text(l.t("Iluminação Lateral / Caixa", "Box / Side Lighting"))
-                        .size(15)
-                        .color(TEXT_PRIMARY),
-                    text(l.t(
-                        "Controla os LEDs secundários/laterais em modelos com faixa externa.",
-                        "Controls secondary side/box LEDs on models equipped with side lighting."
-                    ))
-                    .size(12)
-                    .color(TEXT_MUTED),
-                ]
-                .spacing(3),
-                slider_row(
-                    format!("{} ({})", l.t("Modo", "Mode"), self.box_draft.mode),
-                    0.0..=10.0,
-                    self.box_draft.mode as f32,
-                    1.0,
-                    |v| Message::BoxModeChanged(v as u8),
-                ),
-                slider_row(
-                    format!("{} ({})", l.t("Colorido", "Colorful"), self.box_draft.colorful),
-                    0.0..=1.0,
-                    self.box_draft.colorful as f32,
-                    1.0,
-                    |v| Message::BoxColorfulChanged(v as u8),
-                ),
-                slider_row(
-                    format!("{} ({})", l.t("Brilho", "Brightness"), self.box_draft.brightness),
-                    0.0..=255.0,
-                    self.box_draft.brightness as f32,
-                    1.0,
-                    |v| Message::BoxBrightnessChanged(v as u8),
-                ),
-                slider_row(
-                    format!("{} ({})", l.t("Velocidade", "Speed"), self.box_draft.speed),
-                    0.0..=255.0,
-                    self.box_draft.speed as f32,
-                    1.0,
-                    |v| Message::BoxSpeedChanged(v as u8),
-                ),
-            ]
-            .spacing(10)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style);
-
-        column![main_card, box_card].spacing(12).into()
-    }
-
-    fn view_performance(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let sub_tabs = container(
-            row![
-                button(text(l.t("Curso & Rapid Trigger", "Travel & Rapid Trigger")).size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.perf_sub == PerfSubTab::Travel))
-                    .on_press(Message::SelectPerfSubTab(PerfSubTab::Travel)),
-                button(text(l.t("Calibração", "Calibration")).size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.perf_sub == PerfSubTab::Calibration))
-                    .on_press(Message::SelectPerfSubTab(PerfSubTab::Calibration)),
-                button(text(l.t("Modos & Recursos", "Features & Modes")).size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.perf_sub == PerfSubTab::Performance))
-                    .on_press(Message::SelectPerfSubTab(PerfSubTab::Performance)),
-            ]
-            .spacing(6),
-        )
-        .padding(4)
-        .style(segmented_bar_style);
-
-        let body: Element<'_, Message> = match self.perf_sub {
-            PerfSubTab::Travel => {
-                // Auto-focus whichever key is currently pressed deepest; fallback to first selected key
-                let deepest = self
-                    .snap
-                    .trip_mm
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, &mm)| mm > 0.04 && self.snap.populated.get(*i).copied().unwrap_or(true))
-                    .max_by(|a, b| a.1.total_cmp(b.1))
-                    .map(|(i, _)| i);
-                let focus_idx = deepest
-                    .or_else(|| self.selected_keys.iter().next().copied())
-                    .unwrap_or(0);
-
-                let live_mm = self.snap.trip_mm.get(focus_idx).copied().unwrap_or(0.0);
-                let peak_mm = self.snap.peak_mm.get(focus_idx).copied().unwrap_or(0.0);
-                let focus_name = self
-                    .snap
-                    .config
-                    .as_ref()
-                    .and_then(|c| {
-                        let cols = self.snap.board.cols;
-                        let r = focus_idx / cols;
-                        let c_col = focus_idx % cols;
-                        let decoded = keycodes::decode_keymap(&c.keymap, self.layer, self.snap.board.rows, cols);
-                        decoded.get(r).and_then(|row| row.get(c_col)).map(|&kc| keycodes::label(kc))
-                    })
-                    .unwrap_or_else(|| format!("#{focus_idx}"));
-
-                let gauge_card = container(
-                    column![
-                        row![
-                            column![
-                                text(format!(
-                                    "{} · {}",
-                                    l.t("MEDIDOR DE CURSO AO VIVO", "LIVE TRAVEL GAUGE"),
-                                    focus_name
-                                ))
-                                .size(10)
-                                .color(TEXT_MUTED),
-                                row![
-                                    text(format!("{live_mm:.2} mm"))
-                                        .size(26)
-                                        .color(if live_mm >= self.actuation_mm {
-                                            GREEN_OK
-                                        } else {
-                                            TEXT_PRIMARY
-                                        }),
-                                    Space::with_width(Length::Fixed(18.0)),
-                                    column![
-                                        text(l.t("PICO", "PEAK")).size(10).color(TEXT_MUTED),
-                                        text(format!("{peak_mm:.2} mm")).size(16).color(ACCENT_BLUE),
-                                    ],
-                                ]
-                                .align_y(Alignment::Center),
-                            ]
-                            .spacing(4),
-                            Space::with_width(Length::Fill),
-                            button(text(l.t("Zerar Picos", "Reset Peaks")).size(12))
-                                .padding([6, 12])
-                                .style(secondary_button_style)
-                                .on_press(Message::ResetPeaks),
-                        ]
-                        .align_y(Alignment::Center),
-                        TravelGaugeBar {
-                            live_mm,
-                            peak_mm,
-                            actuation_mm: self.actuation_mm,
-                        }
-                        .view(),
-                        row![
-                            text("0.00 mm").size(10).color(TEXT_MUTED),
-                            Space::with_width(Length::Fill),
-                            text(format!(
-                                "{}: {:.2} mm",
-                                l.t("Ponto de atuação", "Actuation"),
-                                self.actuation_mm
-                            ))
-                            .size(10)
-                            .color(TEXT_SECONDARY),
-                            Space::with_width(Length::Fill),
-                            text("3.50 mm").size(10).color(TEXT_MUTED),
-                        ],
-                    ]
-                    .spacing(10)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style);
-
-                let act_card = container(
-                    column![
-                        row![
-                            column![
-                                text(l.t("Ponto de Atuação", "Actuation Point"))
-                                    .size(15)
-                                    .color(TEXT_PRIMARY),
-                                text(l.t(
-                                    "Distância que a tecla precisa descer para registrar o clique (0.10 mm = ultra sensível, 2.00 mm = padrão).",
-                                    "Travel distance required to register a keystroke (0.10 mm = ultra-sensitive, 2.00 mm = standard)."
-                                ))
-                                .size(12)
-                                .color(TEXT_MUTED),
-                            ]
-                            .spacing(3),
-                            Space::with_width(Length::Fill),
-                            button(text(l.t("Aplicar na Seleção", "Apply to Selection")).size(12))
-                                .padding([6, 12])
-                                .style(secondary_button_style)
-                                .on_press(Message::ApplyActuation),
-                        ]
-                        .align_y(Alignment::Center),
-                        slider_row(
-                            format!("{} ({:.2} mm)", l.t("Atuação", "Actuation"), self.actuation_mm),
-                            0.10..=3.50,
-                            self.actuation_mm.min(3.50),
-                            0.05,
-                            Message::ActuationChanged,
-                        ),
-                    ]
-                    .spacing(10)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style);
-
-                let rt_card = container(
-                    column![
-                        row![
-                            column![
-                                row![
-                                    text("Rapid Trigger").size(15).color(TEXT_PRIMARY),
-                                    Space::with_width(Length::Fixed(12.0)),
-                                    toggler(self.rt_enabled).on_toggle(Message::RtEnabledToggled),
-                                ]
-                                .align_y(Alignment::Center),
-                                text(l.t(
-                                    "Reinicia a tecla instantaneamente ao começar a soltar, permitindo repetições muito mais rápidas.",
-                                    "Resets the key immediately as you begin releasing, enabling rapid repeated inputs."
-                                ))
-                                .size(12)
-                                .color(TEXT_MUTED),
-                            ]
-                            .spacing(3),
-                            Space::with_width(Length::Fill),
-                            button(text(l.t("Aplicar na Seleção", "Apply to Selection")).size(12))
-                                .padding([6, 12])
-                                .style(secondary_button_style)
-                                .on_press(Message::ApplyRapidTrigger),
-                        ]
-                        .align_y(Alignment::Center),
-                        slider_row(
-                            format!(
-                                "{} ({:.2} mm)",
-                                l.t("Sensibilidade Pressionar", "Press Sensitivity"),
-                                self.rt_press_mm
-                            ),
-                            0.05..=2.00,
-                            self.rt_press_mm,
-                            0.05,
-                            Message::RtPressChanged,
-                        ),
-                        slider_row(
-                            format!(
-                                "{} ({:.2} mm)",
-                                l.t("Sensibilidade Soltar", "Release Sensitivity"),
-                                self.rt_release_mm
-                            ),
-                            0.05..=2.00,
-                            self.rt_release_mm,
-                            0.05,
-                            Message::RtReleaseChanged,
-                        ),
-                    ]
-                    .spacing(10)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style);
-
-                let db_card = container(
-                    column![
-                        column![
-                            text(l.t("Zona Morta (Dead Band)", "Dead Band"))
-                                .size(15)
-                                .color(TEXT_PRIMARY),
-                            text(l.t(
-                                "Margem de proteção no repouso (topo) e no fim de curso (fundo) para evitar toques acidentais ou falhas no fundo.",
-                                "Safety margin at rest (top) and bottom-out to avoid accidental triggers or chatter."
-                            ))
-                            .size(12)
-                            .color(TEXT_MUTED),
-                        ]
-                        .spacing(3),
-                        slider_row(
-                            format!(
-                                "{} ({:.2} mm)",
-                                l.t("Zona Morta Topo", "Top Dead Zone"),
-                                self.dead_top_mm
-                            ),
-                            0.00..=1.00,
-                            self.dead_top_mm,
-                            0.05,
-                            Message::DeadBandTopChanged,
-                        ),
-                        slider_row(
-                            format!(
-                                "{} ({:.2} mm)",
-                                l.t("Zona Morta Fundo", "Bottom Dead Zone"),
-                                self.dead_bot_mm
-                            ),
-                            0.00..=1.00,
-                            self.dead_bot_mm,
-                            0.05,
-                            Message::DeadBandBottomChanged,
-                        ),
-                    ]
-                    .spacing(10)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style);
-
-                column![gauge_card, act_card, rt_card, db_card]
-                    .spacing(12)
-                    .into()
-            }
-            PerfSubTab::Calibration => {
-                let calibrated = self.snap.populated.iter().filter(|&&p| p).count();
-                container(
-                    column![
-                        text(l.t("Calibração dos Switches", "Switch Calibration"))
-                            .size(15)
-                            .color(TEXT_PRIMARY),
-                        text(format!(
-                            "{}: {calibrated} / {}",
-                            l.t("Switches calibrados detectados", "Calibrated switches detected"),
-                            self.snap.board.total_keys()
-                        ))
-                        .size(12)
-                        .color(TEXT_SECONDARY),
-                        text(l.t(
-                            "Clique em \"Iniciar Calibração\", pressione todas as teclas firmemente até o final e clique em \"Finalizar Calibração\".",
-                            "Click Start Calibration, press every key fully to bottom-out, then click Finish Calibration."
-                        ))
-                        .size(12)
-                        .color(TEXT_MUTED),
-                        row![
-                            button(text(l.t("Iniciar Calibração", "Start Calibration")).size(12))
-                                .padding([7, 14])
-                                .style(primary_button_style)
-                                .on_press(Message::StartCalibration),
-                            button(text(l.t("Finalizar Calibração", "Finish Calibration")).size(12))
-                                .padding([7, 14])
-                                .style(secondary_button_style)
-                                .on_press(Message::FinishCalibration),
-                        ]
-                        .spacing(10),
-                    ]
-                    .spacing(10)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style)
-                .into()
-            }
-            PerfSubTab::Performance => {
-                let cfg = self.snap.config.as_ref();
-                let gm = cfg.map(|c| c.game_mode != 0).unwrap_or(false);
-                let bo = cfg.map(|c| c.bottom_optimize != 0).unwrap_or(false);
-                let f = cfg.map(|c| c.feature).unwrap_or_default();
-
-                container(
-                    column![
-                        text(l.t("Modos e Recursos de Hardware", "Hardware Modes & Flags"))
-                            .size(15)
-                            .color(TEXT_PRIMARY),
-                        toggle_desc_row(
-                            l.t("Modo Jogo (Game Mode)", "Game Mode"),
-                            l.t("Prioriza resposta mínima de latência no controlador.", "Optimizes controller scan loop for minimum gaming latency."),
-                            gm,
-                            Message::GameModeToggled,
-                        ),
-                        toggle_desc_row(
-                            l.t("Otimização de Fim de Curso", "Bottom Optimize"),
-                            l.t("Suaviza a leitura do sensor quando o switch chega ao fundo.", "Stabilizes Hall sensor reading at bottom-out."),
-                            bo,
-                            Message::BottomOptimizeToggled,
-                        ),
-                        toggle_desc_row(
-                            l.t("Área RGB", "RGB Area"),
-                            l.t("Habilita iluminação de área secundária no teclado.", "Enables secondary RGB lighting zone."),
-                            f.rgb_area != 0,
-                            Message::FeatureRgbAreaToggled,
-                        ),
-                        toggle_desc_row(
-                            l.t("Inverter WASD / Setas", "Swap WASD / Arrows"),
-                            l.t("Troca a função física das teclas WASD pelas setas direcionais.", "Swaps WASD keys with arrow keys."),
-                            f.wasd_switch != 0,
-                            Message::FeatureWasdToggled,
-                        ),
-                        toggle_desc_row(
-                            l.t("Modo macOS", "macOS Mode"),
-                            l.t("Ajusta modificadores (Alt/Cmd) para o padrão Mac.", "Swaps Option/Command modifiers for macOS."),
-                            f.mac_switch != 0,
-                            Message::FeatureMacToggled,
-                        ),
-                        toggle_desc_row(
-                            l.t("Trava Tecla Windows (Win Lock)", "Win Lock"),
-                            l.t("Desabilita a tecla Super/Windows para evitar acidentes em jogos.", "Disables the Windows/Super key to prevent accidental presses."),
-                            f.win_lock != 0,
-                            Message::FeatureWinLockToggled,
-                        ),
-                        toggle_desc_row(
-                            "NKRO (N-Key Rollover)",
-                            l.t("Permite registrar todas as teclas simultaneamente sem ghosting.", "Allows simultaneous registration of all keys without ghosting."),
-                            f.nkro_switch != 0,
-                            Message::FeatureNkroToggled,
-                        ),
-                    ]
-                    .spacing(12)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style)
-                .into()
-            }
-        };
-
-        column![sub_tabs, body].spacing(12).into()
-    }
-
-    fn view_advanced_key(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let sub_tabs = container(
-            row![
-                button(text("Rappy Snappy (RS)").size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.adv_sub == AdvSubTab::RappySnappy))
-                    .on_press(Message::SelectAdvSubTab(AdvSubTab::RappySnappy)),
-                button(text("SOCD").size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.adv_sub == AdvSubTab::Socd))
-                    .on_press(Message::SelectAdvSubTab(AdvSubTab::Socd)),
-                button(text("Hold / Click (MT)").size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.adv_sub == AdvSubTab::HoldClick))
-                    .on_press(Message::SelectAdvSubTab(AdvSubTab::HoldClick)),
-                button(text("Dynamic Key Stroke (DKS)").size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.adv_sub == AdvSubTab::Dks))
-                    .on_press(Message::SelectAdvSubTab(AdvSubTab::Dks)),
-                button(text("Toggle (TGL)").size(12))
-                    .padding([6, 12])
-                    .style(tab_button_style(self.adv_sub == AdvSubTab::Toggle))
-                    .on_press(Message::SelectAdvSubTab(AdvSubTab::Toggle)),
-            ]
-            .spacing(6),
-        )
-        .padding(4)
-        .style(segmented_bar_style);
-
-        let mut slot_row = Row::new().spacing(4).align_y(Alignment::Center);
-        slot_row = slot_row.push(text("Slot:").size(12).color(TEXT_SECONDARY));
-        for i in 0..16 {
-            slot_row = slot_row.push(
-                button(text(format!("{i}")).size(11))
-                    .padding([4, 8])
-                    .style(tab_button_style(self.adv_slot == i))
-                    .on_press(Message::AdvSlotSelected(i)),
-            );
-        }
-
-        let editor: Element<'_, Message> = match self.adv_sub {
-            AdvSubTab::RappySnappy | AdvSubTab::Socd => {
-                let (title, desc) = if self.adv_sub == AdvSubTab::Socd {
-                    (
-                        l.t("Editor de Par SOCD", "SOCD Pair Editor"),
-                        l.t(
-                            "Resolve direções opostas simultâneas (ex: A + D), priorizando a última tecla pressionada.",
-                            "Resolves simultaneous opposite cardinal directions (e.g. A + D) using last-input priority.",
-                        ),
-                    )
-                } else {
-                    (
-                        l.t("Editor Rappy Snappy (RS)", "Rappy Snappy (RS) Pair Editor"),
-                        l.t(
-                            "Compara duas teclas e ativa apenas a que estiver pressionada mais fundo no momento.",
-                            "Monitors two keys and prioritizes whichever key is currently pressed deeper.",
-                        ),
-                    )
-                };
-                container(
-                    column![
-                        text(title).size(15).color(TEXT_PRIMARY),
-                        text(desc).size(12).color(TEXT_MUTED),
-                        row![
-                            text(l.t("Tecla 1 (linha, col):", "Key 1 (row, col):")).size(12).color(TEXT_SECONDARY),
-                            text_input("row", &self.adv_k1_r)
-                                .on_input(Message::AdvKey1RowChanged)
-                                .width(Length::Fixed(60.0))
-                                .style(input_style),
-                            text_input("col", &self.adv_k1_c)
-                                .on_input(Message::AdvKey1ColChanged)
-                                .width(Length::Fixed(60.0))
-                                .style(input_style),
-                            Space::with_width(Length::Fixed(16.0)),
-                            text(l.t("Tecla 2 (linha, col):", "Key 2 (row, col):")).size(12).color(TEXT_SECONDARY),
-                            text_input("row", &self.adv_k2_r)
-                                .on_input(Message::AdvKey2RowChanged)
-                                .width(Length::Fixed(60.0))
-                                .style(input_style),
-                            text_input("col", &self.adv_k2_c)
-                                .on_input(Message::AdvKey2ColChanged)
-                                .width(Length::Fixed(60.0))
-                                .style(input_style),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                        slider_row(
-                            format!("{} ({:.2} mm)", l.t("Limiar", "Threshold"), self.adv_apc),
-                            0.10..=3.50,
-                            self.adv_apc.min(3.50),
-                            0.05,
-                            Message::AdvApcChanged,
-                        ),
-                        toggle_row(
-                            l.t("Rapid Trigger no par", "Rapid Trigger on Pair"),
-                            self.adv_rt,
-                            Message::AdvRtToggled,
-                        ),
-                        row![
-                            button(text(l.t("Salvar Par", "Save Pair")).size(12))
-                                .padding([6, 14])
-                                .style(primary_button_style)
-                                .on_press(Message::SaveAdvancedKey),
-                            button(text(l.t("Limpar Slot", "Clear Slot")).size(12))
-                                .padding([6, 14])
-                                .style(danger_button_style)
-                                .on_press(Message::ClearAdvancedKey),
-                        ]
-                        .spacing(8),
-                    ]
-                    .spacing(10)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style)
-                .into()
-            }
-            AdvSubTab::HoldClick => container(
-                column![
-                    text("Hold / Click (Tap Dance / MT)").size(15).color(TEXT_PRIMARY),
-                    text(l.t(
-                        "Executa um código de tecla no toque rápido (Tap) e outro ao manter pressionado (Hold).",
-                        "Fires one keycode on quick tap and a different keycode when held past the timer."
-                    ))
-                    .size(12)
-                    .color(TEXT_MUTED),
-                    row![
-                        text(l.t("Keycode Tap (hex):", "Tap Keycode (hex):")).size(12).color(TEXT_SECONDARY),
-                        text_input("0x0004", &self.mt_tap)
-                            .on_input(Message::MtTapChanged)
-                            .width(Length::Fixed(100.0))
-                            .style(input_style),
-                        text(l.t("Keycode Hold (hex):", "Hold Keycode (hex):")).size(12).color(TEXT_SECONDARY),
-                        text_input("0x00E1", &self.mt_hold)
-                            .on_input(Message::MtHoldChanged)
-                            .width(Length::Fixed(100.0))
-                            .style(input_style),
-                        text("Timer (ms):").size(12).color(TEXT_SECONDARY),
-                        text_input("200", &self.mt_timer)
-                            .on_input(Message::MtTimerChanged)
-                            .width(Length::Fixed(80.0))
-                            .style(input_style),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center),
-                    button(text(l.t("Salvar Slot MT", "Save Hold/Click Slot")).size(12))
-                        .padding([6, 14])
-                        .style(primary_button_style)
-                        .on_press(Message::SaveTapDance),
-                ]
-                .spacing(10)
-                .padding(18),
-            )
-            .width(Length::Fill)
-            .style(card_style)
-            .into(),
-            AdvSubTab::Dks => {
-                let mut rows_col = Column::new().spacing(8);
-                for (i, act) in self.dks_draft.actions.iter().enumerate() {
-                    let kc_str = format!("{:#06x}", act.keycode());
-                    let st_str = format!("{:#06x}", act.status);
-                    let kc_clone = kc_str.clone();
-                    let st_clone = st_str.clone();
-                    rows_col = rows_col.push(
-                        row![
-                            text(format!("{} {i}:", l.t("Ação", "Action"))).size(12).color(TEXT_SECONDARY),
-                            text_input("keycode", &kc_str)
-                                .on_input(move |s| Message::DksActionChanged(i, s, st_clone.clone()))
-                                .width(Length::Fixed(100.0))
-                                .style(input_style),
-                            text(l.t("Máscara:", "Trigger Mask:")).size(12).color(TEXT_SECONDARY),
-                            text_input("mask", &st_str)
-                                .on_input(move |s| Message::DksActionChanged(i, kc_clone.clone(), s))
-                                .width(Length::Fixed(100.0))
-                                .style(input_style),
-                        ]
-                        .spacing(8)
-                        .align_y(Alignment::Center),
-                    );
-                }
-                container(
-                    column![
-                        text("Dynamic Key Stroke (DKS)").size(15).color(TEXT_PRIMARY),
-                        text(l.t(
-                            "Dispara até 4 ações diferentes em pontos distintos de descida e subida de uma tecla.",
-                            "Triggers up to 4 distinct actions across press and release travel points."
-                        ))
-                        .size(12)
-                        .color(TEXT_MUTED),
-                        rows_col,
-                        button(text(l.t("Salvar Slot DKS", "Save DKS Slot")).size(12))
-                            .padding([6, 14])
-                            .style(primary_button_style)
-                            .on_press(Message::SaveDks),
-                    ]
-                    .spacing(10)
-                    .padding(18),
-                )
-                .width(Length::Fill)
-                .style(card_style)
-                .into()
-            }
-            AdvSubTab::Toggle => container(
-                column![
-                    text("Toggle Switch (TGL)").size(15).color(TEXT_PRIMARY),
-                    text(l.t(
-                        "TGL não é suportado pelo firmware DuckBread (protocolo v9).",
-                        "TGL is not supported by DuckBread firmware protocol v9."
-                    ))
-                    .size(12)
-                    .color(TEXT_MUTED),
-                ]
-                .spacing(8)
-                .padding(18),
-            )
-            .width(Length::Fill)
-            .style(card_style)
-            .into(),
-        };
-
-        column![sub_tabs, slot_row, editor].spacing(12).into()
-    }
-
-    fn view_app_trigger(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let none_lbl = l.t("(Nenhum)", "(None)").to_string();
-        let mut prof_choices = vec![none_lbl.clone()];
-        prof_choices.extend(self.profiles.iter().cloned());
-        let cur_default = self
-            .switcher_cfg
-            .default_profile
-            .clone()
-            .unwrap_or(none_lbl);
-
-        let status_card = container(
-            column![
-                row![
-                    column![
-                        text(l.t("Troca Automática por App", "Auto-Switcher")).size(15).color(TEXT_PRIMARY),
-                        text(l.t(
-                            "Aplica automaticamente o perfil vinculado ao focar uma janela (sem desgaste de memória flash).",
-                            "Automatically switches profiles in RAM when a matching app window gains focus (zero flash wear)."
-                        ))
-                        .size(12)
-                        .color(TEXT_MUTED),
-                    ]
-                    .spacing(3),
-                    Space::with_width(Length::Fixed(12.0)),
-                    toggler(self.switcher_cfg.enabled).on_toggle(Message::ToggleAutoSwitcher),
-                    Space::with_width(Length::Fill),
-                    container(
-                        text(format!("Backend: {}", watcher_backend_name()))
-                            .size(11)
-                            .color(TEXT_SECONDARY)
-                    )
-                    .padding([4, 10])
-                    .style(badge_style(ACCENT_BLUE)),
-                ]
-                .align_y(Alignment::Center),
-                row![
-                    text(l.t("App em foco agora:", "Foreground App:")).size(12).color(TEXT_SECONDARY),
-                    text(
-                        self.snap
-                            .foreground_exe
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or("—")
-                    )
-                    .size(12)
-                    .color(ACCENT_BLUE),
-                    Space::with_width(Length::Fill),
-                    text(l.t("Perfil Padrão (Fallback):", "Default Fallback:")).size(12).color(TEXT_SECONDARY),
-                    pick_list(prof_choices, Some(cur_default), Message::SetDefaultProfile)
-                        .style(pick_list_style),
-                ]
-                .spacing(8)
-                .align_y(Alignment::Center),
-            ]
-            .spacing(12)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style);
-
-        let add_card = container(
-            column![
-                text(format!(
-                    "{}{}",
-                    l.t("Vincular App ao Perfil", "Bind App to Profile"),
-                    self.selected_profile
-                        .as_deref()
-                        .map(|p| format!(" ({p})"))
-                        .unwrap_or_default()
-                ))
-                .size(15)
-                .color(TEXT_PRIMARY),
-                row![
-                    text_input(
-                        l.t("Executável (ex: cs2, vivaldi-bin)", "Executable (e.g. cs2, firefox)"),
-                        &self.trigger_exe
-                    )
-                    .on_input(Message::TriggerExeChanged)
-                    .style(input_style),
-                    text_input(
-                        l.t("Título da janela (opcional)", "Window Title (optional)"),
-                        &self.trigger_title
-                    )
-                    .on_input(Message::TriggerTitleChanged)
-                    .style(input_style),
-                    button(text(l.t("Adicionar Regra", "Add Rule")).size(12))
-                        .padding([7, 14])
-                        .style(primary_button_style)
-                        .on_press(Message::AddTriggerRule),
-                ]
-                .spacing(8),
-                row![
-                    text(l.t("Janelas Abertas (clique para preencher):", "Running Windows (click to fill):"))
-                        .size(12)
-                        .color(TEXT_SECONDARY),
-                    Space::with_width(Length::Fill),
-                    button(text(l.t("Atualizar Janelas", "Refresh Processes")).size(11))
-                        .padding([4, 10])
-                        .style(secondary_button_style)
-                        .on_press(Message::RefreshProcesses),
-                ]
-                .align_y(Alignment::Center),
-                {
-                    let mut proc_row = Row::new().spacing(6);
-                    for p in self.processes.iter().take(16) {
-                        proc_row = proc_row.push(
-                            button(text(p.exe.clone()).size(11))
-                                .padding([4, 9])
-                                .style(secondary_button_style)
-                                .on_press(Message::PickRunningProcess(p.exe.clone())),
-                        );
-                    }
-                    scrollable(proc_row).direction(scrollable::Direction::Horizontal(
-                        scrollable::Scrollbar::default(),
-                    ))
-                }
-            ]
-            .spacing(10)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style);
-
-        let mut rules_col = Column::new().spacing(6);
-        if self.switcher_cfg.rules.is_empty() {
-            rules_col = rules_col.push(
-                text(l.t("Nenhuma regra configurada ainda.", "No rules configured yet."))
-                    .size(12)
-                    .color(TEXT_MUTED),
-            );
-        }
-        for (i, r) in self.switcher_cfg.rules.iter().enumerate() {
-            rules_col = rules_col.push(
-                container(
-                    row![
-                        text(&r.profile).size(12).color(ACCENT_BLUE),
-                        text(format!("exe: {}   title: {}", r.exe, r.title))
-                            .size(12)
-                            .color(TEXT_PRIMARY),
-                        Space::with_width(Length::Fill),
-                        button(text(l.t("Remover", "Remove")).size(11))
-                            .padding([3, 8])
-                            .style(danger_button_style)
-                            .on_press(Message::RemoveTriggerRule(i)),
-                    ]
-                    .spacing(12)
-                    .align_y(Alignment::Center)
-                    .padding([8, 12]),
-                )
-                .style(elevated_card_style),
-            );
-        }
-
-        let rules_card = container(
-            column![
-                text(l.t("Regras Configuradas", "Configured Rules"))
-                    .size(15)
-                    .color(TEXT_PRIMARY),
-                rules_col,
-            ]
-            .spacing(8)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style);
-
-        let _ = TriggerBinding::default();
-        column![status_card, add_card, rules_card].spacing(12).into()
-    }
-
-    fn view_other_settings(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let info_card = container(
-            column![
-                text(l.t("Diagnóstico, Backup e Memória Flash", "Diagnostics, Backup & Flash"))
-                    .size(15)
-                    .color(TEXT_PRIMARY),
-                text(l.t(
-                    "No uso diário os ajustes ficam na RAM do teclado. Use \"Salvar na Flash\" para gravar permanentemente ou exporte um backup JSON completo.",
-                    "Daily tweaks apply to volatile RAM. Use Save to Flash to persist across power cycles, or export a full JSON backup."
-                ))
-                .size(12)
-                .color(TEXT_MUTED),
-                text(format!(
-                    "{}: {} (PID {:#06x}) · {}: {}x{} · {}: {:?} · Firmware: {:?}",
-                    l.t("Placa", "Board"),
-                    self.snap.board.name,
-                    self.snap.board.product_id,
-                    l.t("Matriz", "Geometry"),
-                    self.snap.board.rows,
-                    self.snap.board.cols,
-                    l.t("Protocolo", "Protocol"),
-                    self.snap.protocol_version,
-                    self.snap.firmware_version,
-                ))
-                .size(12)
-                .color(TEXT_SECONDARY),
-                row![
-                    button(text(l.t("Salvar na Flash", "Save to Flash")).size(12))
-                        .padding([7, 14])
-                        .style(primary_button_style)
-                        .on_press(Message::CommitToFlash),
-                    button(text(l.t("Exportar Backup", "Export Backup")).size(12))
-                        .padding([7, 14])
-                        .style(secondary_button_style)
-                        .on_press(Message::ExportBackup),
-                    button(text(l.t("Restaurar Backup", "Restore Backup")).size(12))
-                        .padding([7, 14])
-                        .style(secondary_button_style)
-                        .on_press(Message::RestoreBackup),
-                    button(text(l.t("Reportar Placa", "Report Board")).size(12))
-                        .padding([7, 14])
-                        .style(secondary_button_style)
-                        .on_press(Message::OpenGithubIssue),
-                ]
-                .spacing(8),
-            ]
-            .spacing(10)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style);
-
-        let danger_card = container(
-            column![
-                text(l.t("Factory Reset (Memória Interna do Teclado)", "Factory Reset (Onboard Memory)"))
-                    .size(15)
-                    .color(RED_DANGER),
-                text(l.t(
-                    "Digite RESET abaixo para confirmar a limpeza da calibração e perfil salvo no teclado.",
-                    "Type RESET below to confirm wiping onboard calibration and profile memory."
-                ))
-                .size(12)
-                .color(TEXT_MUTED),
-                row![
-                    text_input(l.t("Digite RESET", "Type RESET"), &self.factory_confirm)
-                        .on_input(Message::FactoryResetInputChanged)
-                        .width(Length::Fixed(180.0))
-                        .style(input_style),
-                    button(text("Factory Reset").size(12))
-                        .padding([7, 14])
-                        .style(danger_button_style)
-                        .on_press(Message::ConfirmFactoryReset),
-                ]
-                .spacing(10),
-            ]
-            .spacing(10)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style);
-
-        column![info_card, danger_card].spacing(12).into()
-    }
-
-    fn view_macros(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let mut slots = Row::new().spacing(4);
-        for i in 0..16 {
-            slots = slots.push(
-                button(text(format!("M{i}")).size(11))
-                    .padding([5, 9])
-                    .style(tab_button_style(self.macro_slot == i))
-                    .on_press(Message::SelectMacroSlot(i)),
-            );
-        }
-
-        let kinds = vec![
-            "tap".to_string(),
-            "down".to_string(),
-            "up".to_string(),
-            "delay".to_string(),
-            "text".to_string(),
-        ];
-
-        let add_row = row![
-            pick_list(kinds, Some(self.macro_step_kind.clone()), Message::MacroStepKindChanged)
-                .style(pick_list_style),
-            text_input(
-                l.t("Keycode (0x04) / ms / texto", "Keycode (0x04) / ms / text"),
-                &self.macro_step_val
-            )
-            .on_input(Message::MacroStepValChanged)
-            .style(input_style),
-            button(text(l.t("Adicionar Passo", "Add Step")).size(12))
-                .padding([7, 14])
-                .style(secondary_button_style)
-                .on_press(Message::AddMacroStep),
-            Space::with_width(Length::Fill),
-            button(text(l.t("Salvar Slot", "Save Slot")).size(12))
-                .padding([7, 14])
-                .style(primary_button_style)
-                .on_press(Message::SaveMacroSlot),
-            button(text(l.t("Limpar", "Clear")).size(12))
-                .padding([7, 14])
-                .style(danger_button_style)
-                .on_press(Message::ClearMacroSlot),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center);
-
-        let mut steps_col = Column::new().spacing(6);
-        for (idx, step) in self.macro_steps.iter().enumerate() {
-            let desc = match step {
-                MacroStep::Tap { keycode } => format!("Tap  {}", keycodes::label(*keycode)),
-                MacroStep::Down { keycode } => format!("Down {}", keycodes::label(*keycode)),
-                MacroStep::Up { keycode } => format!("Up   {}", keycodes::label(*keycode)),
-                MacroStep::Delay { delay_ms } => format!("Delay {delay_ms} ms"),
-                MacroStep::Text { text } => format!("Text \"{text}\""),
-            };
-            steps_col = steps_col.push(
-                container(
-                    row![
-                        text(format!("{idx:02}. {desc}")).size(12).color(TEXT_PRIMARY),
-                        Space::with_width(Length::Fill),
-                        button(text(l.t("Remover", "Remove")).size(11))
-                            .padding([3, 8])
-                            .style(danger_button_style)
-                            .on_press(Message::RemoveMacroStep(idx)),
-                    ]
-                    .align_y(Alignment::Center)
-                    .padding([6, 12]),
-                )
-                .style(elevated_card_style),
-            );
-        }
-
-        container(
-            column![
-                text(l.t(
-                    "Macros Onboard (16 Slots Compartilhados)",
-                    "Onboard Macros (16 Shared Slots)"
-                ))
-                .size(16)
-                .color(TEXT_PRIMARY),
-                text(l.t(
-                    "Macros ficam armazenadas na memória interna do teclado e são compartilhadas por todos os perfis.",
-                    "Macros live in the keyboard's onboard memory and are shared across every profile."
-                ))
-                .size(12)
-                .color(TEXT_MUTED),
-                slots,
-                add_row,
-                steps_col,
-            ]
-            .spacing(12)
-            .padding(18),
-        )
-        .width(Length::Fill)
-        .style(card_style)
-        .into()
-    }
-
-    fn view_settings(&self) -> Element<'_, Message> {
-        let l = self.lang;
-        let upd_text = match &self.update_info {
-            None => format!("{} v{APP_VERSION}", l.t("Versão atual:", "Running")),
-            Some(Ok(u)) if u.available => format!(
-                "{}: v{} ({} v{})",
-                l.t("Atualização disponível", "Update available"),
-                u.latest,
-                l.t("atual", "current"),
-                u.current
-            ),
-            Some(Ok(u)) => format!("{} (v{})", l.t("Atualizado", "Up to date"), u.current),
-            Some(Err(e)) => e.clone(),
-        };
-
-        let langs = vec!["Português (BR)".to_string(), "English".to_string()];
-        let cur_lang = if l.is_pt() {
-            "Português (BR)".to_string()
-        } else {
-            "English".to_string()
-        };
-
-        let card = container(
-            column![
-                row![
-                    text(l.t("Configurações", "Settings")).size(18).color(TEXT_PRIMARY),
-                    Space::with_width(Length::Fill),
-                    button(text(l.t("Voltar", "Back")).size(12))
-                        .padding([6, 12])
-                        .style(secondary_button_style)
-                        .on_press(Message::ToggleSettingsModal(false)),
-                ]
-                .align_y(Alignment::Center),
-                row![
-                    text(l.t("Idioma da Interface", "Interface Language"))
-                        .size(13)
-                        .color(TEXT_PRIMARY),
-                    Space::with_width(Length::Fill),
-                    pick_list(langs, Some(cur_lang), Message::SelectLanguage).style(pick_list_style),
-                ]
-                .align_y(Alignment::Center),
-                toggle_row(
-                    l.t("Verificar atualizações ao iniciar", "Check for updates on startup"),
-                    self.settings.check_updates,
-                    Message::CheckUpdatesPrefToggled,
-                ),
-                toggle_row(
-                    l.t("Iniciar junto com o sistema", "Start at login"),
-                    self.settings.start_at_login,
-                    Message::StartAtLoginToggled,
-                ),
-                {
-                    let has_upd = matches!(&self.update_info, Some(Ok(u)) if u.available);
-                    let mut upd_row = row![
-                        text(upd_text).size(12).color(TEXT_SECONDARY),
-                        Space::with_width(Length::Fill),
-                        button(text(l.t("Verificar Agora", "Check Now")).size(12))
-                            .padding([6, 12])
-                            .style(secondary_button_style)
-                            .on_press(Message::CheckUpdates),
-                    ]
-                    .spacing(8)
-                    .align_y(Alignment::Center);
-                    if has_upd {
-                        upd_row = upd_row.push(
-                            button(text(l.t("Instalar Atualização", "Install Update")).size(12))
-                                .padding([6, 12])
-                                .style(primary_button_style)
-                                .on_press(Message::InstallUpdate),
-                        );
-                    }
-                    upd_row
-                },
-                column![
-                    text(l.t("Calibração de Cor dos LEDs (Ganho RGB)", "LED Channel Color Calibration (Gain)"))
-                        .size(15)
-                        .color(TEXT_PRIMARY),
-                    text(l.t(
-                        "Equilibra o balanço de branco dos LEDs em tempo real (verde e azul costumam ser mais fortes que o vermelho).",
-                        "Balances LED white point in real time (green/blue diodes are naturally brighter than red)."
-                    ))
-                    .size(12)
-                    .color(TEXT_MUTED),
-                ]
-                .spacing(3),
-                slider_row(
-                    format!("{} ({:.2})", l.t("Ganho Vermelho", "Red Gain"), self.settings.led_gain[0]),
-                    0.1..=1.0,
-                    self.settings.led_gain[0],
-                    0.01,
-                    Message::GainRChanged,
-                ),
-                slider_row(
-                    format!("{} ({:.2})", l.t("Ganho Verde", "Green Gain"), self.settings.led_gain[1]),
-                    0.1..=1.0,
-                    self.settings.led_gain[1],
-                    0.01,
-                    Message::GainGChanged,
-                ),
-                slider_row(
-                    format!("{} ({:.2})", l.t("Ganho Azul", "Blue Gain"), self.settings.led_gain[2]),
-                    0.1..=1.0,
-                    self.settings.led_gain[2],
-                    0.01,
-                    Message::GainBChanged,
-                ),
-                row![
-                    button(text(l.t("Brilho Máximo Original (1.0, 1.0, 1.0)", "Original Max Brightness (1.0, 1.0, 1.0)")).size(12))
-                        .padding([6, 12])
-                        .style(primary_button_style)
-                        .on_press(Message::SetGainPreset([1.0, 1.0, 1.0])),
-                    button(text(l.t("Balanço Suave (1.0, 0.65, 0.75)", "Soft White Balance (1.0, 0.65, 0.75)")).size(12))
-                        .padding([6, 12])
-                        .style(secondary_button_style)
-                        .on_press(Message::SetGainPreset([1.0, 0.65, 0.75])),
-                ]
-                .spacing(8),
-            ]
-            .spacing(12)
-            .padding(20),
-        )
-        .width(Length::Fill)
-        .style(card_style);
-
-        container(scrollable(card))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(24)
-            .into()
+        self.view_shell()
     }
 }
 
-fn slider_row<'a>(
-    label: String,
-    range: std::ops::RangeInclusive<f32>,
-    value: f32,
-    step: f32,
-    on_change: impl Fn(f32) -> Message + 'a,
-) -> Element<'a, Message> {
-    row![
-        text(label)
-            .size(12)
-            .color(TEXT_SECONDARY)
-            .width(Length::Fixed(195.0)),
-        slider(range, value, on_change)
-            .step(step)
-            .style(slider_style),
-    ]
-    .spacing(12)
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn toggle_row<'a>(
-    label: &'a str,
-    val: bool,
-    on_toggle: impl Fn(bool) -> Message + 'a,
-) -> Element<'a, Message> {
-    row![
-        text(label).size(13).color(TEXT_PRIMARY),
-        Space::with_width(Length::Fill),
-        toggler(val).on_toggle(on_toggle),
-    ]
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn toggle_desc_row<'a>(
-    label: &'a str,
-    desc: &'a str,
-    val: bool,
-    on_toggle: impl Fn(bool) -> Message + 'a,
-) -> Element<'a, Message> {
-    row![
-        column![
-            text(label).size(13).color(TEXT_PRIMARY),
-            text(desc).size(11).color(TEXT_MUTED),
-        ]
-        .spacing(2),
-        Space::with_width(Length::Fill),
-        toggler(val).on_toggle(on_toggle),
-    ]
-    .align_y(Alignment::Center)
-    .into()
-}
-
-fn parse_u16_hex_or_dec(s: &str) -> Option<u16> {
+pub(crate) fn parse_u16_hex_or_dec(s: &str) -> Option<u16> {
     let t = s.trim();
     if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
         u16::from_str_radix(hex, 16).ok()
@@ -3412,7 +1640,7 @@ fn parse_u16_hex_or_dec(s: &str) -> Option<u16> {
     }
 }
 
-fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
+pub(crate) fn parse_hex_rgb(s: &str) -> Option<(u8, u8, u8)> {
     let t = s.trim().trim_start_matches('#');
     if t.len() != 6 || !t.bytes().all(|b| b.is_ascii_hexdigit()) {
         return None;

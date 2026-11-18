@@ -353,6 +353,32 @@ pub fn primary_button_style(
     }
 }
 
+pub fn toggle_primary_style(
+    active: bool,
+    accent: Color,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        if active {
+            primary_button_style(accent)(theme, status)
+        } else {
+            secondary_button_style(theme, status)
+        }
+    }
+}
+
+pub fn confirm_button_style(
+    danger: bool,
+    accent: Color,
+) -> impl Fn(&iced::Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        if danger {
+            danger_button_style(theme, status)
+        } else {
+            primary_button_style(accent)(theme, status)
+        }
+    }
+}
+
 pub fn secondary_button_style(_theme: &iced::Theme, status: button::Status) -> button::Style {
     let (bg, txt) = match status {
         button::Status::Hovered => (BG_HOVER, TEXT_PRIMARY),

@@ -17,7 +17,7 @@
 
 ---
 
-O **OpenMAD-Rust** substitui completamente o configurador web oficial da Madlions e o protótipo original em Python/Web por uma aplicação **100% nativa em Rust** (`openmad-core` + `openmad-ui` com `iced`). O resultado é inicialização instantânea, consumo mínimo de memória, zero dependências de Electron/Chromium ou runtime Python e suporte nativo para **Linux (KDE Plasma Wayland, X11)** e **Windows**.
+O **OpenMAD-Rust** substitui completamente o configurador web oficial da Madlions e o protótipo legado em Python/Web por uma aplicação **100% nativa em Rust** (`openmad-core` + `openmad-ui` com `iced`). O resultado é inicialização instantânea, consumo mínimo de memória, zero dependências de Electron/Chromium ou runtime Python e suporte nativo para **Linux (KDE Plasma Wayland, Hyprland, Sway/i3, X11)** e **Windows**.
 
 > [!NOTE]
 > Este projeto é um fork e reescrita completa em Rust inspirada na engenharia reversa de protocolo HID USB realizada pelo projeto original [acciaw/OpenMAD](https://github.com/acciaw/OpenMAD).
@@ -35,10 +35,19 @@ O **OpenMAD-Rust** substitui completamente o configurador web oficial da Madlion
 ### Remapeamento de Teclas & Camadas
 ![Remapeamento de Teclas](assets/screenshots/remap.png)
 
-### Troca Automática de Perfil por Aplicativo (KDE Wayland / Windows)
+### Teclas Avançadas (Rappy Snappy, SOCD, Hold/Click, DKS & Toggle)
+![Teclas Avançadas](assets/screenshots/advanced.png)
+
+### Gravador de Macros Onboard & Medidor de Memória Flash
+![Macros Onboard](assets/screenshots/macros.png)
+
+### Troca Automática de Perfil por Aplicativo (KDE Wayland / Hyprland / Sway / X11 / Windows)
 ![App Trigger](assets/screenshots/app-trigger.png)
 
-### Configurações, Calibração RGB, Autostart & Auto-Updater
+### Sistema, Flash, Backup & Relatório de Diagnóstico de Placa
+![Sistema e Flash](assets/screenshots/system.png)
+
+### Configurações, Calibração RGB, Bandeja, Autostart & Auto-Updater
 ![Configurações](assets/screenshots/settings.png)
 
 ---
@@ -50,18 +59,22 @@ O projeto é dividido em dois crates principais no workspace Cargo:
 1. **`openmad-core` (Driver, Protocolo e Daemons)**
    - **Comunicação HID Bruta (`hidapi`)**: Conecta-se diretamente à interface VIA/vendor (`VID 0x373B`, `usage_page 0xFF60`) do teclado magnético sem exigir navegador WebHID.
    - **Pré-visualização em RAM vs. Gravação em Flash**: Alterações de brilho, cor, atuação e Rapid Trigger são enviadas em tempo real para o teclado sem desgaste prematuro da memória flash interna (`FlashOp::Normal`). A gravação permanente ocorre apenas quando você salva explicitamente na memória interna (*Onboard Flash*).
-   - **Amostrador de Telemetria (`sampler.rs`)**: Lê continuamente a posição analógica dos sensores Hall (calibrados até **3.50 mm**) e envia pacotes de telemetria ao vivo para o medidor de curso da interface gráfica.
+   - **Amostrador de Telemetria (`sampler.rs`)**: Lê continuamente a posição analógica dos sensores Hall (calibrados até **3.50 mm**) e valores ADC brutos de calibração, enviando telemetria e histórico de traçado ao vivo para a interface gráfica.
    - **App Switcher Multiplataforma (`switcher.rs`)**:
      - **Linux / KDE Plasma Wayland**: Carrega automaticamente uma ponte leve via D-Bus no **KWin Scripting** (`openmad_kwin_bridge`), detectando a janela em foco em tempo real no Wayland sem precisar desativar segurança ou usar XWayland forçado.
+     - **Linux / Hyprland & Sway / i3**: Consulta nativamente o socket IPC (`HYPRLAND_INSTANCE_SIGNATURE` `.socket.sock` e `SWAYSOCK`/`I3SOCK`).
      - **Windows**: Monitora o processo/título da janela em primeiro plano via API Win32 (`GetForegroundWindow`).
+   - **Perfis, Keymaps & Importação Legada (`profile.rs`, `backup.rs`)**: Suporta keymaps completos, seleção de regras de App Trigger associadas e importação de perfis legados JSON (`profile_version: 2`).
+   - **Diagnóstico de Hardware (`diagnostics.rs`)**: Gera relatório técnico JSON com versões/capacidades/interfaces HID e teste volátil opcional em RAM (`FlashOp::Normal`).
    - **Auto-Updater (`updater.rs`)**: Consulta as releases oficiais de `muriloscolari/OpenMAD-Rust` no GitHub, baixa o instalador ou binário da nova versão e aplica a atualização automaticamente.
    - **Autostart & Bandeja (`settings.rs`)**: Registra inicialização automática com argumento `--minimized` (via `~/.config/autostart/openmad.desktop` no Linux ou `HKCU\...\Run` no Windows).
 
 2. **`openmad-ui` (Interface Gráfica & Bandeja do Sistema)**
-   - Construída em **`iced 0.13` (`iced::daemon`)** com aceleração GPU e fonte `Inter`.
+   - Construída em **`iced 0.13` (`iced::daemon`)** com aceleração GPU, fonte `Inter` e diálogos nativos assíncronos (`rfd`).
    - **Idioma bilíngue dinâmico (`PT` / `EN`)** alternável com um clique no cabeçalho lateral.
    - **Seletor de Cores 2D (HSV + Paleta Rápida)** que atualiza o teclado instantaneamente ao clicar ou arrastar.
-   - **Ícone de Bandeja Nativo (`tray-icon`)**: Fechar a janela pelo `X` ou iniciar com `--minimized` mantém o aplicativo rodando discretamente na bandeja do sistema, com menu de clique direito para abrir a janela, alternar perfis salvos instantaneamente ou sair.
+   - **Osciloscópio de Curso ao Vivo & Editores Visuais**: Traçado analógico em tempo real (0.00–3.50 mm), editor visual 4×4 de **DKS**, seletor visual de **SOCD/RS** (4 modos) e **Hold-Click (MT)**, além de **Gravador de Macros** direto pelo teclado com barra de uso da flash.
+   - **Ícone de Bandeja Nativo (`tray-icon`)**: Fechar a janela pelo `X` ou iniciar com `--minimized` mantém o aplicativo rodando discretamente na bandeja do sistema, com menu dinâmico em PT/EN para abrir a janela, alternar o App Switcher, gravar na flash, trocar o perfil ativo (`●`) ou sair.
 
 ---
 
@@ -152,12 +165,15 @@ Se você preferir que o botão interno **Instalar Atualização** consiga substi
 
 ---
 
-## Inicialização Automática na Bandeja (`Autostart`)
+## Linha de Comando (CLI) & Inicialização na Bandeja (`Autostart`)
 
-Você pode ativar ou desativar a inicialização automática diretamente em **Configurações -> Iniciar minimizado na bandeja com o sistema** — ou passar `--minimized` / `--tray` na linha de comando:
+Você pode ativar ou desativar a inicialização automática diretamente em **Configurações -> Iniciar minimizado na bandeja com o sistema** — ou usar as opções de linha de comando:
 
 ```bash
-openmad --minimized
+openmad --minimized             # inicia apenas na bandeja (--tray é equivalente)
+openmad --list-profiles         # lista os perfis salvos e sai
+openmad --apply-profile <NOME>  # aplica um perfil na RAM e sai
+openmad --help                  # exibe todas as opções disponíveis
 ```
 
 - **Linux**: cria/remove `~/.config/autostart/openmad.desktop` apontando para o executável atual com `--minimized`.

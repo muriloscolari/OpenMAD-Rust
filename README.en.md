@@ -17,7 +17,7 @@
 
 ---
 
-**OpenMAD-Rust** completely replaces the official Madlions web configurator and the earlier Python/web prototype with a **100% native Rust application** (`openmad-core` + `iced`-based `openmad-ui`). It boots instantly, uses minimal system resources, requires zero Electron/Chromium or Python runtime overhead, and supports **Linux (KDE Plasma Wayland, X11)** and **Windows** out of the box.
+**OpenMAD-Rust** completely replaces the official Madlions web configurator and the retired Python/web prototype with a **100% native Rust application** (`openmad-core` + `iced`-based `openmad-ui`). It boots instantly, uses minimal system resources, requires zero Electron/Chromium or Python runtime overhead, and supports **Linux (KDE Plasma Wayland, Hyprland, Sway/i3, X11)** and **Windows** out of the box.
 
 > [!NOTE]
 > This project is a fork and full Rust rewrite inspired by the USB HID protocol reverse-engineering documented in [acciaw/OpenMAD](https://github.com/acciaw/OpenMAD).
@@ -35,10 +35,19 @@
 ### Key Remapping & Layers
 ![Key Remapping](assets/screenshots/remap.png)
 
-### Per-App Profile Auto-Switching (KDE Wayland / Windows)
+### Advanced Keys (Rappy Snappy, SOCD, Hold/Click, DKS & Toggle)
+![Advanced Keys](assets/screenshots/advanced.png)
+
+### Onboard Macro Recorder & Flash Buffer Meter
+![Onboard Macros](assets/screenshots/macros.png)
+
+### Per-App Profile Auto-Switching (KDE Wayland / Hyprland / Sway / X11 / Windows)
 ![App Trigger](assets/screenshots/app-trigger.png)
 
-### Settings, RGB Gain Calibration, Autostart & Auto-Updater
+### System, Flash, JSON Backups & Board Diagnostic Report
+![System and Flash](assets/screenshots/system.png)
+
+### Settings, RGB Gain Calibration, Tray, Autostart & Auto-Updater
 ![Settings](assets/screenshots/settings.png)
 
 ---
@@ -50,18 +59,22 @@ The workspace is structured into two Cargo crates:
 1. **`openmad-core` (Driver, HID Protocol & Daemons)**
    - **Raw USB HID (`hidapi`)**: Connects directly to the keyboard's VIA/vendor HID interface (`VID 0x373B`, `usage_page 0xFF60`) without needing browser WebHID permissions.
    - **RAM Preview vs. Flash Writes**: Lighting, actuation point, deadband, and Rapid Trigger tweaks stream live to RAM (`FlashOp::Normal`) so you see instant results without wearing out onboard flash. Permanent flash commits happen only when explicitly saving to onboard memory.
-   - **Live Telemetry Sampler (`sampler.rs`)**: Polls Hall-effect sensor travel continuously (calibrated up to **3.50 mm**) and feeds live readings + peak values to the UI gauge.
+   - **Live Telemetry Sampler (`sampler.rs`)**: Polls Hall-effect sensor travel continuously (calibrated up to **3.50 mm**) and raw ADC calibration values, feeding live trace waveforms and peak values to the UI.
    - **Cross-Platform App Switcher (`switcher.rs`)**:
      - **Linux / KDE Plasma Wayland**: Automatically loads a lightweight **KWin Scripting** D-Bus bridge (`openmad_kwin_bridge`) to read the focused window class/caption in real time on native Wayland.
+     - **Linux / Hyprland & Sway / i3**: Natively queries compositor IPC sockets (`HYPRLAND_INSTANCE_SIGNATURE` `.socket.sock` and `SWAYSOCK`/`I3SOCK`).
      - **Windows**: Polls foreground executable and window title natively via Win32 APIs (`GetForegroundWindow`).
+   - **Profiles, Keymaps & Legacy Import (`profile.rs`, `backup.rs`)**: Supports full layer keymaps, synced per-profile App Trigger rules, and legacy JSON profile import (`profile_version: 2`).
+   - **Hardware Diagnostics (`diagnostics.rs`)**: Exports a sanitized JSON report with board capabilities/HID interfaces and an optional non-destructive RAM write probe (`FlashOp::Normal`).
    - **Self-Updater (`updater.rs`)**: Queries GitHub Releases (`muriloscolari/OpenMAD-Rust`), downloads the latest installer or binary asset, and applies the upgrade cleanly.
    - **Autostart (`settings.rs`)**: Registers OS sign-in launch with `--minimized` (`~/.config/autostart/openmad.desktop` on Linux; `HKCU\...\Run` on Windows).
 
 2. **`openmad-ui` (GPU-Accelerated GUI & System Tray)**
-   - Built with **`iced 0.13` (`iced::daemon`)** and the bundled `Inter` font.
+   - Built with **`iced 0.13` (`iced::daemon`)**, the bundled `Inter` font, and non-blocking native file dialogs (`rfd`).
    - **Instant Bilingual UI (`PT` / `EN`)** switchable from the sidebar header.
    - **2D HSV Color Picker Canvas + Quick Swatches** updating hardware LEDs immediately on click or drag.
-   - **Native System Tray (`tray-icon`)**: Closing the window via `X` or launching with `--minimized` keeps OpenMAD-Rust running quietly in the system tray with right-click controls to show the window, switch saved profiles on the fly, or exit.
+   - **Live Travel Oscilloscope & Visual Editors**: Real-time travel trace graph (0.00–3.50 mm), visual 4×4 **DKS** grid, 4-mode **SOCD/RS** selector, visual **Hold-Click (MT)** key picker, and live **Macro Recorder** with flash byte usage indicator.
+   - **Native System Tray (`tray-icon`)**: Closing the window via `X` or launching with `--minimized` keeps OpenMAD-Rust running quietly in the system tray with a dynamic PT/EN menu to open the window, toggle Auto-Switcher, commit to flash, switch active profiles (`●`), or exit.
 
 ---
 
@@ -152,12 +165,15 @@ If you want the built-in **Install Update** button on Linux to self-replace the 
 
 ---
 
-## Autostart Minimized to Tray
+## CLI Options & Autostart Minimized to Tray
 
-Enable or disable autostart inside **Settings -> Start minimized in system tray**, or launch directly with `--minimized` / `--tray`:
+Enable or disable autostart inside **Settings -> Start minimized in system tray**, or use the built-in CLI flags:
 
 ```bash
-openmad --minimized
+openmad --minimized             # start directly in the system tray (--tray works too)
+openmad --list-profiles         # list saved profile names and exit
+openmad --apply-profile <NAME>  # apply a profile to RAM and exit
+openmad --help                  # show available CLI options
 ```
 
 - **Linux**: manages `~/.config/autostart/openmad.desktop` launching the current binary with `--minimized`.

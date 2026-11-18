@@ -1,3 +1,0 @@
-# Allow non-root access to Madlions / DuckBread HE keyboards (VID 0x373B)
-KERNEL=="hidraw*", ATTRS{idVendor}=="373b", MODE="0666", TAG+="uaccess"
-SUBSYSTEM=="usb", ATTRS{idVendor}=="373b", MODE="0666", TAG+="uaccess"

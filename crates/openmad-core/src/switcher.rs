@@ -138,22 +138,12 @@ impl SwitcherConfig {
     }
 }
 
+#[derive(Default)]
 pub struct SwitcherState {
     pub active_profile: Option<String>,
     pub candidate_profile: Option<String>,
     pub candidate_since: Option<Instant>,
     pub last_switch: Option<Instant>,
-}
-
-impl Default for SwitcherState {
-    fn default() -> Self {
-        Self {
-            active_profile: None,
-            candidate_profile: None,
-            candidate_since: None,
-            last_switch: None,
-        }
-    }
 }
 
 impl SwitcherState {
@@ -481,8 +471,186 @@ pushState();
         })
     }
 
+    fn is_hyprland() -> bool {
+        std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some()
+    }
+
+    fn is_sway_or_i3() -> bool {
+        std::env::var_os("SWAYSOCK").is_some() || std::env::var_os("I3SOCK").is_some()
+    }
+
+    fn hyprland_socket_path() -> Option<std::path::PathBuf> {
+        let sig = std::env::var("HYPRLAND_INSTANCE_SIGNATURE").ok()?;
+        if let Some(xdg) = std::env::var_os("XDG_RUNTIME_DIR") {
+            let p = std::path::PathBuf::from(xdg)
+                .join("hypr")
+                .join(&sig)
+                .join(".socket.sock");
+            if p.exists() {
+                return Some(p);
+            }
+        }
+        let tmp = std::path::PathBuf::from("/tmp/hypr")
+            .join(sig)
+            .join(".socket.sock");
+        if tmp.exists() {
+            Some(tmp)
+        } else {
+            None
+        }
+    }
+
+    fn hyprland_query(cmd: &str) -> Option<serde_json::Value> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let path = hyprland_socket_path()?;
+        let mut stream = UnixStream::connect(path).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+        stream.write_all(cmd.as_bytes()).ok()?;
+        let mut raw = String::new();
+        stream.read_to_string(&mut raw).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    fn hyprland_foreground() -> Option<ForegroundApp> {
+        let v = hyprland_query("j/activewindow")?;
+        let pid = v.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let cls = v.get("class").and_then(|x| x.as_str()).unwrap_or("");
+        let title = v.get("title").and_then(|x| x.as_str()).unwrap_or("");
+        let info = resolve_window_entry(pid, cls, title);
+        if info.exe.is_empty() && info.title.is_empty() {
+            None
+        } else {
+            Some(ForegroundApp {
+                exe: info.exe,
+                path: info.path,
+                title: info.title,
+            })
+        }
+    }
+
+    fn hyprland_windows(map: &mut BTreeMap<String, WindowedProcess>) {
+        let Some(serde_json::Value::Array(items)) = hyprland_query("j/clients") else {
+            return;
+        };
+        for item in items {
+            let pid = item.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+            let cls = item.get("class").and_then(|x| x.as_str()).unwrap_or("");
+            let title = item.get("title").and_then(|x| x.as_str()).unwrap_or("");
+            let info = resolve_window_entry(pid, cls, title);
+            if !info.exe.is_empty() {
+                map.entry(info.exe.to_lowercase()).or_insert(info);
+            }
+        }
+    }
+
+    fn sway_get_tree() -> Option<serde_json::Value> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+
+        let sock = std::env::var_os("SWAYSOCK").or_else(|| std::env::var_os("I3SOCK"))?;
+        let mut stream = UnixStream::connect(sock).ok()?;
+        let _ = stream.set_read_timeout(Some(Duration::from_millis(150)));
+        let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+
+        // i3-ipc header: "i3-ipc" + payload_len (u32 ne) + msg_type=4 (GET_TREE, u32 ne)
+        let mut req = [0u8; 14];
+        req[0..6].copy_from_slice(b"i3-ipc");
+        req[6..10].copy_from_slice(&0u32.to_ne_bytes());
+        req[10..14].copy_from_slice(&4u32.to_ne_bytes());
+        stream.write_all(&req).ok()?;
+
+        let mut hdr = [0u8; 14];
+        stream.read_exact(&mut hdr).ok()?;
+        if &hdr[0..6] != b"i3-ipc" {
+            return None;
+        }
+        let len = u32::from_ne_bytes([hdr[6], hdr[7], hdr[8], hdr[9]]) as usize;
+        if len > 8 * 1024 * 1024 {
+            return None;
+        }
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).ok()?;
+        serde_json::from_slice(&body).ok()
+    }
+
+    fn sway_node_info(node: &serde_json::Value) -> WindowedProcess {
+        let pid = node.get("pid").and_then(|x| x.as_u64()).unwrap_or(0) as u32;
+        let app_id = node
+            .get("app_id")
+            .and_then(|x| x.as_str())
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                node.get("window_properties")
+                    .and_then(|wp| wp.get("class"))
+                    .and_then(|x| x.as_str())
+            })
+            .unwrap_or("");
+        let title = node.get("name").and_then(|x| x.as_str()).unwrap_or("");
+        resolve_window_entry(pid, app_id, title)
+    }
+
+    fn sway_find_focused(node: &serde_json::Value) -> Option<ForegroundApp> {
+        if node.get("focused").and_then(|x| x.as_bool()) == Some(true) {
+            let info = sway_node_info(node);
+            if !info.exe.is_empty() || !info.title.is_empty() {
+                return Some(ForegroundApp {
+                    exe: info.exe,
+                    path: info.path,
+                    title: info.title,
+                });
+            }
+        }
+        for key in ["nodes", "floating_nodes"] {
+            if let Some(arr) = node.get(key).and_then(|x| x.as_array()) {
+                for child in arr {
+                    if let Some(found) = sway_find_focused(child) {
+                        return Some(found);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn sway_collect_windows(node: &serde_json::Value, map: &mut BTreeMap<String, WindowedProcess>) {
+        let is_leaf = node
+            .get("pid")
+            .and_then(|x| x.as_u64())
+            .is_some_and(|p| p > 0)
+            || node
+                .get("app_id")
+                .and_then(|x| x.as_str())
+                .is_some_and(|s| !s.is_empty());
+        if is_leaf {
+            let info = sway_node_info(node);
+            if !info.exe.is_empty() {
+                map.entry(info.exe.to_lowercase()).or_insert(info);
+            }
+        }
+        for key in ["nodes", "floating_nodes"] {
+            if let Some(arr) = node.get(key).and_then(|x| x.as_array()) {
+                for child in arr {
+                    sway_collect_windows(child, map);
+                }
+            }
+        }
+    }
+
     pub fn backend_name() -> &'static str {
-        if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if is_hyprland() {
+            "Linux (Hyprland)"
+        } else if is_sway_or_i3() {
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                "Linux (Sway)"
+            } else {
+                "Linux (i3)"
+            }
+        } else if std::env::var_os("WAYLAND_DISPLAY").is_some() {
             if std::env::var("XDG_CURRENT_DESKTOP")
                 .unwrap_or_default()
                 .to_uppercase()
@@ -498,13 +666,25 @@ pushState();
     }
 
     pub fn foreground_app() -> Option<ForegroundApp> {
-        // 1. Try KDE KWin D-Bus Scripting bridge (native on KDE Plasma 6 Wayland).
+        if is_hyprland() {
+            if let Some(app) = hyprland_foreground() {
+                return Some(app);
+            }
+        }
+        if is_sway_or_i3() {
+            if let Some(tree) = sway_get_tree() {
+                if let Some(app) = sway_find_focused(&tree) {
+                    return Some(app);
+                }
+            }
+        }
+        // Try KDE KWin D-Bus Scripting bridge (native on KDE Plasma 6 Wayland).
         if is_kde_wayland() {
             if let Some(app) = kde_wayland_foreground() {
                 return Some(app);
             }
         }
-        // 2. Fallback to X11 (_NET_ACTIVE_WINDOW) — also covers XWayland apps if DISPLAY is set.
+        // Fallback to X11 (_NET_ACTIVE_WINDOW) — also covers XWayland apps if DISPLAY is set.
         x11_foreground()
     }
 
@@ -603,8 +783,7 @@ pushState();
         let raw = String::from_utf8_lossy(&class_prop.value);
         let exe = raw
             .split('\0')
-            .filter(|s| !s.is_empty())
-            .last()
+            .rfind(|s| !s.is_empty())
             .unwrap_or("")
             .to_string();
         Some(ForegroundApp {
@@ -616,6 +795,16 @@ pushState();
 
     pub fn list_windowed_processes() -> Vec<WindowedProcess> {
         let mut map: BTreeMap<String, WindowedProcess> = BTreeMap::new();
+
+        if is_hyprland() {
+            hyprland_windows(&mut map);
+        }
+
+        if is_sway_or_i3() {
+            if let Some(tree) = sway_get_tree() {
+                sway_collect_windows(&tree, &mut map);
+            }
+        }
 
         if is_kde_wayland() {
             if let Some(state) = ensure_kwin_bridge() {
@@ -703,4 +892,69 @@ mod platform {
     pub fn backend_name() -> &'static str { "Unsupported" }
     pub fn foreground_app() -> Option<ForegroundApp> { None }
     pub fn list_windowed_processes() -> Vec<WindowedProcess> { Vec::new() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_rule_matching_and_glob() {
+        let r = Rule {
+            profile: "FPS".into(),
+            exe: "cs2*".into(),
+            title: "*Counter-Strike*".into(),
+        };
+        let app_ok = ForegroundApp {
+            exe: "cs2.exe".into(),
+            path: "/games/cs2.exe".into(),
+            title: "Counter-Strike 2".into(),
+        };
+        let app_wrong_title = ForegroundApp {
+            exe: "cs2.exe".into(),
+            path: "".into(),
+            title: "Settings".into(),
+        };
+        assert!(r.matches(&app_ok));
+        assert!(!r.matches(&app_wrong_title));
+
+        let empty_rule = Rule {
+            profile: "X".into(),
+            exe: "".into(),
+            title: "".into(),
+        };
+        assert!(!empty_rule.matches(&app_ok));
+    }
+
+    #[test]
+    fn test_switcher_config_resolve_and_debounce_dwell() {
+        let cfg = SwitcherConfig {
+            enabled: true,
+            default_profile: Some("Default".into()),
+            rules: vec![Rule {
+                profile: "Browser".into(),
+                exe: "firefox".into(),
+                title: String::new(),
+            }],
+            poll_ms: 100,
+            debounce_ms: 0,
+            min_dwell_ms: 0,
+            ..Default::default()
+        };
+
+        let ff = ForegroundApp {
+            exe: "firefox".into(),
+            path: String::new(),
+            title: "Docs".into(),
+        };
+        assert_eq!(cfg.resolve(Some(&ff)).as_deref(), Some("Browser"));
+        assert_eq!(cfg.resolve(None).as_deref(), Some("Default"));
+
+        let mut state = SwitcherState::default();
+        // First tick records candidate; second tick (after debounce_ms=0) activates
+        assert_eq!(state.evaluate(&cfg, Some(&ff)), None);
+        assert_eq!(state.evaluate(&cfg, Some(&ff)).as_deref(), Some("Browser"));
+        // Same target does not re-trigger
+        assert_eq!(state.evaluate(&cfg, Some(&ff)), None);
+    }
 }

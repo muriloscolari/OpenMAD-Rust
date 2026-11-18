@@ -1,6 +1,6 @@
 # Maintainer: Murilo Scolari <https://github.com/muriloscolari/OpenMAD-Rust>
 pkgname=openmad-rust
-pkgver=0.1.1
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="100% Native Rust driver and GUI for MAD68 HE / MAD60 HE Hall-effect keyboards"
 arch=('x86_64')

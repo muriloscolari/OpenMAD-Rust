@@ -1,13 +1,13 @@
 //! Application shell: sidebar navigation, top header with profile selector & unified Save,
-//! collapsible keyboard view, and floating overlay menus / toasts.
+//! collapsible keyboard view, confirmation & diagnostic modals, and floating overlay menus / toasts.
 
-use crate::app::{Message, NavSection, OpenMadApp};
+use crate::app::{KeyZone, Message, NavSection, OpenMadApp, PerfSubTab};
 use crate::theme::{
-    card_style, danger_button_style, elevated_card_style, ghost_button_style,
-    header_style, input_style, nav_button_style, pick_list_style, primary_button_style,
-    secondary_button_style, sidebar_style, toast_style, type_scale, warn_banner_style,
-    with_alpha, AMBER_WARN, BG_BASE, BORDER_SUBTLE, FONT_MEDIUM, FONT_SEMIBOLD, GREEN_OK,
-    RED_DANGER, SP_LG, SP_MD, SP_SM, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    card_style, confirm_button_style, contrast_on, danger_button_style, elevated_card_style,
+    ghost_button_style, header_style, input_style, nav_button_style, pick_list_style,
+    primary_button_style, secondary_button_style, sidebar_style, toast_style, type_scale,
+    warn_banner_style, with_alpha, AMBER_WARN, BG_BASE, BORDER_SUBTLE, FONT_MEDIUM, FONT_SEMIBOLD,
+    GREEN_OK, RED_DANGER, SP_LG, SP_MD, SP_SM, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use crate::ui::components::{badge, empty_state};
 use crate::ui::icons::{icon, Icon};
@@ -17,6 +17,7 @@ use iced::widget::{
     Column, Row, Space,
 };
 use iced::{Alignment, Color, Element, Length};
+use openmad_core::diagnostics::DiagnosticOutput;
 use openmad_core::protocol::KNOWN_PROTOCOL_VERSION;
 use openmad_core::updater::APP_VERSION;
 
@@ -59,6 +60,14 @@ impl OpenMadApp {
 
         if self.save_menu_open {
             layers.push(self.view_save_menu(accent));
+        }
+
+        if let Some(ref dlg) = self.confirm_dialog {
+            layers.push(self.view_confirm_modal(dlg, accent));
+        }
+
+        if let Some(ref diag) = self.diag_output {
+            layers.push(self.view_diag_modal(diag, accent));
         }
 
         if let Some((ref msg, is_err, _)) = self.toast {
@@ -136,7 +145,6 @@ impl OpenMadApp {
             nav_sys = nav_sys.push(self.nav_item(sec, ic, lbl, accent));
         }
 
-        // Device status card in sidebar footer
         let status_color = if self.snap.connected {
             if self.snap.read_only {
                 AMBER_WARN
@@ -324,11 +332,11 @@ impl OpenMadApp {
         let save_btn = row![
             button(
                 row![
-                    icon(Icon::Save, 14, crate::theme::contrast_on(accent)),
+                    icon(Icon::Save, 14, contrast_on(accent)),
                     text(l.t("Salvar", "Save"))
                         .size(type_scale::BODY)
                         .font(FONT_SEMIBOLD),
-                    icon(Icon::ChevronDown, 13, crate::theme::contrast_on(accent)),
+                    icon(Icon::ChevronDown, 13, contrast_on(accent)),
                 ]
                 .spacing(6)
                 .align_y(Alignment::Center),
@@ -361,7 +369,6 @@ impl OpenMadApp {
         let l = self.lang;
         let mut col = Column::new().spacing(SP_MD).padding([16, 22]);
 
-        // Safety & connection banners
         if self.snap.connected && !self.snap.firmware_verified {
             let pv = self.snap.protocol_version.unwrap_or(0);
             col = col.push(
@@ -402,7 +409,7 @@ impl OpenMadApp {
                         button(text(l.t("Desbloquear Escrita", "Unlock Writes")).size(type_scale::CAPTION + 1))
                             .padding([4, 10])
                             .style(secondary_button_style)
-                            .on_press(Message::UnlockBoard),
+                            .on_press(Message::RequestUnlockBoard),
                     ]
                     .spacing(8)
                     .align_y(Alignment::Center),
@@ -413,7 +420,6 @@ impl OpenMadApp {
             );
         }
 
-        // Collapsible Keyboard Canvas on keyboard-oriented sections
         if matches!(
             self.section,
             NavSection::Keys | NavSection::Lighting | NavSection::Performance | NavSection::Advanced
@@ -478,7 +484,15 @@ impl OpenMadApp {
             );
         }
 
-        let sel_hint = if self.selected_keys.is_empty() {
+        let sel_hint = if self.adv_pick_target.is_some()
+            && self.section == NavSection::Advanced
+        {
+            l.t(
+                "Modo seleção de par: clique em uma tecla abaixo para atribuir",
+                "Pair picking mode: click a key below to assign",
+            )
+            .to_string()
+        } else if self.selected_keys.is_empty() {
             l.t(
                 "0 teclas selecionadas (ajustes aplicam em todo o teclado)",
                 "0 keys selected (edits apply to the whole keyboard)",
@@ -498,6 +512,22 @@ impl OpenMadApp {
                 .font(FONT_MEDIUM)
                 .color(TEXT_SECONDARY),
             Space::with_width(Length::Fill),
+            button(text("WASD").size(type_scale::CAPTION))
+                .padding([4, 8])
+                .style(secondary_button_style)
+                .on_press(Message::SelectKeyZone(KeyZone::Wasd)),
+            button(text(l.t("Setas", "Arrows")).size(type_scale::CAPTION))
+                .padding([4, 8])
+                .style(secondary_button_style)
+                .on_press(Message::SelectKeyZone(KeyZone::Arrows)),
+            button(text(l.t("Números", "Numbers")).size(type_scale::CAPTION))
+                .padding([4, 8])
+                .style(secondary_button_style)
+                .on_press(Message::SelectKeyZone(KeyZone::Numbers)),
+            button(text("Mods").size(type_scale::CAPTION))
+                .padding([4, 8])
+                .style(secondary_button_style)
+                .on_press(Message::SelectKeyZone(KeyZone::Modifiers)),
             button(text(l.t("Todas", "All")).size(type_scale::CAPTION))
                 .padding([4, 9])
                 .style(secondary_button_style)
@@ -525,7 +555,7 @@ impl OpenMadApp {
             .style(ghost_button_style)
             .on_press(Message::ToggleKeyboardCollapsed),
         ]
-        .spacing(6)
+        .spacing(5)
         .align_y(Alignment::Center);
 
         let mut card_col = Column::new().spacing(SP_SM).padding([10, 12]);
@@ -539,6 +569,20 @@ impl OpenMadApp {
                 _ => BoardViewMode::Keymap,
             };
             let cfg_ref = self.snap.config.as_ref();
+            let adv_pair_highlight = if self.section == NavSection::Advanced {
+                Some((
+                    (
+                        self.adv_k1_r.parse::<usize>().unwrap_or(0),
+                        self.adv_k1_c.parse::<usize>().unwrap_or(0),
+                    ),
+                    (
+                        self.adv_k2_r.parse::<usize>().unwrap_or(0),
+                        self.adv_k2_c.parse::<usize>().unwrap_or(0),
+                    ),
+                ))
+            } else {
+                None
+            };
             let kb = KeyboardCanvas {
                 rows: self.snap.board.rows,
                 cols: self.snap.board.cols,
@@ -548,10 +592,16 @@ impl OpenMadApp {
                 layer: self.layer,
                 keymap: cfg_ref.map(|c| c.keymap.as_slice()).unwrap_or(&[]),
                 actuation: cfg_ref.map(|c| c.actuation.as_slice()).unwrap_or(&[]),
+                rapid_trigger: cfg_ref.map(|c| c.rapid_trigger.as_slice()).unwrap_or(&[]),
                 trip_mm: &self.snap.trip_mm,
+                adc_raw: &self.snap.adc_raw,
+                calibration_view: self.section == NavSection::Performance
+                    && self.perf_sub == PerfSubTab::Calibration,
                 key_colors: cfg_ref.map(|c| c.key_colors.as_slice()).unwrap_or(&[]),
                 light_effect: self.light_draft.effect,
                 light_color: [self.light_draft.r, self.light_draft.g, self.light_draft.b],
+                advanced_keys: cfg_ref.map(|c| c.advanced_keys.as_slice()).unwrap_or(&[]),
+                adv_pair_highlight,
                 accent,
             };
             card_col = card_col.push(kb.view(Message::Keyboard));
@@ -574,7 +624,7 @@ impl OpenMadApp {
                 .padding([6, 9])
                 .size(type_scale::CAPTION + 1)
                 .style(input_style(accent)),
-            button(icon(Icon::Plus, 14, crate::theme::contrast_on(accent)))
+            button(icon(Icon::Plus, 14, contrast_on(accent)))
                 .padding([6, 10])
                 .style(primary_button_style(accent))
                 .on_press(Message::CreateProfile(false)),
@@ -583,14 +633,12 @@ impl OpenMadApp {
 
         let mut items = Column::new().spacing(4);
         items = items.push(new_row);
-        items = items.push(
-            self.menu_action_btn(
-                Icon::Upload,
-                l.t("Importar JSON…", "Import JSON…"),
-                Message::ImportProfile,
-                false,
-            ),
-        );
+        items = items.push(self.menu_action_btn(
+            Icon::Upload,
+            l.t("Importar JSON…", "Import JSON…"),
+            Message::ImportProfile,
+            false,
+        ));
         if has_sel {
             items = items.push(self.menu_action_btn(
                 Icon::Download,
@@ -613,13 +661,13 @@ impl OpenMadApp {
             items = items.push(self.menu_action_btn(
                 Icon::HardDrive,
                 l.t("Definir como padrão Onboard", "Set as Onboard default"),
-                Message::SaveProfileOnboard,
+                Message::RequestSaveProfileOnboard,
                 false,
             ));
             items = items.push(self.menu_action_btn(
                 Icon::Trash,
                 l.t("Excluir perfil", "Delete profile"),
-                Message::DeleteProfile,
+                Message::RequestDeleteProfile,
                 true,
             ));
         }
@@ -691,7 +739,7 @@ impl OpenMadApp {
                 .width(Length::Fill)
                 .padding([8, 10])
                 .style(ghost_button_style)
-                .on_press(Message::CommitToFlash),
+                .on_press(Message::RequestCommitToFlash),
             ]
             .spacing(4)
             .padding(8),
@@ -709,6 +757,164 @@ impl OpenMadApp {
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
+    }
+
+    fn view_confirm_modal<'a>(
+        &self,
+        dlg: &'a crate::app::ConfirmDialog,
+        accent: Color,
+    ) -> Element<'a, Message> {
+        let l = self.lang;
+        let confirm_btn = button(
+            text(&dlg.confirm_label)
+                .size(type_scale::BODY)
+                .font(FONT_MEDIUM),
+        )
+        .padding([8, 16])
+        .style(confirm_button_style(dlg.danger, accent))
+        .on_press(Message::ConfirmDialogAccept);
+
+        let panel = container(
+            column![
+                row![
+                    icon(
+                        Icon::AlertTriangle,
+                        18,
+                        if dlg.danger { RED_DANGER } else { AMBER_WARN },
+                    ),
+                    text(&dlg.title)
+                        .size(type_scale::TITLE - 2)
+                        .font(FONT_SEMIBOLD)
+                        .color(TEXT_PRIMARY),
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                text(&dlg.body)
+                    .size(type_scale::BODY)
+                    .color(TEXT_SECONDARY),
+                row![
+                    Space::with_width(Length::Fill),
+                    button(text(l.t("Cancelar", "Cancel")).size(type_scale::BODY))
+                        .padding([8, 14])
+                        .style(secondary_button_style)
+                        .on_press(Message::ConfirmDialogCancel),
+                    confirm_btn,
+                ]
+                .spacing(10),
+            ]
+            .spacing(SP_MD)
+            .padding(SP_LG),
+        )
+        .width(Length::Fixed(460.0))
+        .style(card_style);
+
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_| iced::widget::container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.65))),
+                ..Default::default()
+            })
+            .into()
+    }
+
+    fn view_diag_modal<'a>(
+        &self,
+        diag: &'a DiagnosticOutput,
+        accent: Color,
+    ) -> Element<'a, Message> {
+        let l = self.lang;
+        let wp = &diag.report.write_probe;
+        let wp_badge = if !wp.ran {
+            badge(l.t("Somente leitura", "Read-only"), TEXT_SECONDARY)
+        } else if wp.match_ok == Some(true) && wp.restored != Some(false) {
+            badge(l.t("Write Probe: PASSOU", "Write Probe: PASSED"), GREEN_OK)
+        } else {
+            badge(l.t("Write Probe: FALHOU", "Write Probe: FAILED"), RED_DANGER)
+        };
+
+        let panel = container(
+            column![
+                row![
+                    icon(Icon::HardDrive, 18, accent),
+                    text(l.t("Relatório de Diagnóstico da Placa", "Board Diagnostic Report"))
+                        .size(type_scale::TITLE - 2)
+                        .font(FONT_SEMIBOLD)
+                        .color(TEXT_PRIMARY),
+                    Space::with_width(Length::Fill),
+                    wp_badge,
+                ]
+                .spacing(10)
+                .align_y(Alignment::Center),
+                text(format!(
+                    "{}: {}",
+                    l.t("Salvo em", "Saved to"),
+                    diag.path.display()
+                ))
+                .size(type_scale::CAPTION + 1)
+                .color(TEXT_MUTED),
+                container(
+                    scrollable(
+                        text(&diag.json)
+                            .size(type_scale::CAPTION)
+                            .color(TEXT_SECONDARY),
+                    )
+                    .height(Length::Fixed(280.0)),
+                )
+                .width(Length::Fill)
+                .padding(10)
+                .style(elevated_card_style),
+                row![
+                    Space::with_width(Length::Fill),
+                    button(text(l.t("Fechar", "Close")).size(type_scale::BODY))
+                        .padding([8, 14])
+                        .style(secondary_button_style)
+                        .on_press(Message::CloseDiagModal),
+                    button(
+                        row![
+                            icon(Icon::Copy, 13, TEXT_PRIMARY),
+                            text(l.t("Copiar JSON", "Copy JSON")).size(type_scale::BODY),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([8, 14])
+                    .style(secondary_button_style)
+                    .on_press(Message::CopyDiagJson),
+                    button(
+                        row![
+                            icon(Icon::ExternalLink, 13, contrast_on(accent)),
+                            text(l.t("Abrir Issue no GitHub", "Open GitHub Issue"))
+                                .size(type_scale::BODY)
+                                .font(FONT_MEDIUM),
+                        ]
+                        .spacing(6)
+                        .align_y(Alignment::Center),
+                    )
+                    .padding([8, 14])
+                    .style(primary_button_style(accent))
+                    .on_press(Message::OpenDiagIssueUrl),
+                ]
+                .spacing(10),
+            ]
+            .spacing(SP_MD)
+            .padding(SP_LG),
+        )
+        .width(Length::Fixed(640.0))
+        .style(card_style);
+
+        container(panel)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .center_x(Length::Fill)
+            .center_y(Length::Fill)
+            .style(|_| iced::widget::container::Style {
+                background: Some(iced::Background::Color(Color::from_rgba(0.0, 0.0, 0.0, 0.65))),
+                ..Default::default()
+            })
+            .into()
     }
 
     fn menu_action_btn<'a>(

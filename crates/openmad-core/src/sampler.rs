@@ -1,24 +1,30 @@
 //! Background HID sampler, telemetry poller, and command job queue.
 
 use crate::backup::{export_backup, restore_backup};
-use crate::device::{FullConfig, Mad68};
+use crate::device::{find_interfaces, FullConfig, HidInterfaceInfo, Mad68};
 use crate::devices::{default_board, BoardSpec, UnlockedBoards};
+use crate::diagnostics::{save_and_prepare_diagnostic, DiagnosticOutput};
 use crate::features::{
     AdvancedKey, BoxLight, DeadBand, Dks, KeyboardFeature, LightInfo, MacroStep, TapDance,
 };
-use crate::paths::{onboard_path, profile_dir, settings_path, switcher_config_path, unlocked_boards_path};
+use crate::paths::{
+    onboard_path, profile_dir, settings_path, switcher_config_path, unlocked_boards_path,
+};
 use crate::profile::{profile_path, read_onboard_name, write_onboard_name, Profile};
 use crate::protocol::{travel_to_mm, FlashOp, KNOWN_PROTOCOL_VERSION};
 use crate::settings::AppSettings;
-use crate::switcher::{foreground_app, SwitcherConfig, SwitcherState};
+use crate::switcher::{foreground_app, ForegroundApp, SwitcherConfig, SwitcherState};
 use crossbeam_channel::{unbounded, Sender};
 use std::path::PathBuf;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
     Arc, RwLock,
 };
 use std::thread;
 use std::time::{Duration, Instant};
+
+const FOCUS_TRACE_LEN: usize = 160;
+const FOCUS_BURST_SAMPLES: usize = 4;
 
 #[derive(Debug, Clone)]
 pub struct Snapshot {
@@ -34,7 +40,12 @@ pub struct Snapshot {
     pub populated: Vec<bool>,
     pub trip_mm: Vec<f32>,
     pub peak_mm: Vec<f32>,
+    pub adc_raw: Vec<u16>,
+    pub focus_key: Option<(usize, usize)>,
+    pub focus_trace: Vec<f32>,
+    pub hid_interfaces: Vec<HidInterfaceInfo>,
     pub config: Option<FullConfig>,
+    pub config_seq: u64,
     pub active_profile: Option<String>,
     pub onboard_profile: Option<String>,
     pub foreground_exe: Option<String>,
@@ -57,7 +68,12 @@ impl Default for Snapshot {
             populated: vec![true; total],
             trip_mm: vec![0.0; total],
             peak_mm: vec![0.0; total],
+            adc_raw: Vec::new(),
+            focus_key: None,
+            focus_trace: Vec::new(),
+            hid_interfaces: Vec::new(),
             config: None,
+            config_seq: 0,
             active_profile: None,
             onboard_profile: read_onboard_name(&onboard_path()),
             foreground_exe: None,
@@ -68,6 +84,8 @@ impl Default for Snapshot {
 pub enum DeviceCommand {
     RefreshConfig,
     ResetPeaks,
+    SetFocusKey(Option<(usize, usize)>),
+    SetPollAdc(bool),
     SetActuation { indices: Vec<usize>, mm: f32 },
     SetRapidTrigger { indices: Vec<usize>, enabled: bool, press_mm: f32, release_mm: f32 },
     SetDeadBand(DeadBand),
@@ -79,7 +97,10 @@ pub enum DeviceCommand {
     SetKeyColors { indices: Vec<usize>, color: [u8; 3] },
     SetAllKeyColors(Vec<[u8; 3]>),
     SetKeycode { layer: usize, row: usize, col: usize, keycode: u16 },
+    SetKeycodes { layer: usize, positions: Vec<(usize, usize)>, keycode: u16 },
     ApplyKeymap(Vec<u8>),
+    ApplyProfileKeymap(String),
+    ResetKeymap,
     SetAdvancedKey(AdvancedKey),
     SetDks(Dks),
     SetTapDance(TapDance),
@@ -90,9 +111,11 @@ pub enum DeviceCommand {
     FinishCalibration,
     FactoryReset,
     UnlockBoard(u16),
+    LockBoard(u16),
     SetGain([f32; 3]),
     ExportBackup(PathBuf),
     RestoreBackup { path: PathBuf, commit_flash: bool },
+    RunDiagnostic { write_probe: bool, tx: std::sync::mpsc::Sender<Result<DiagnosticOutput, String>> },
     ReloadSwitcher,
     Respond(Sender<Result<String, String>>, Box<DeviceCommand>),
 }
@@ -111,12 +134,37 @@ impl SamplerHandle {
         let (tx, rx) = unbounded::<DeviceCommand>();
         let stop = Arc::new(AtomicBool::new(false));
 
+        let fg_app: Arc<RwLock<Option<ForegroundApp>>> = Arc::new(RwLock::new(None));
+        let fg_poll_ms = Arc::new(AtomicU64::new(250));
+
+        // Dedicated thread for foreground window queries so X11/D-Bus/IPC never stalls HID polling.
+        let fg_clone = Arc::clone(&fg_app);
+        let fg_poll_clone = Arc::clone(&fg_poll_ms);
+        let fg_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            while !fg_stop.load(Ordering::Relaxed) {
+                let app = foreground_app();
+                if let Ok(mut g) = fg_clone.write() {
+                    *g = app;
+                }
+                let ms = fg_poll_clone.load(Ordering::Relaxed).clamp(100, 2000);
+                thread::sleep(Duration::from_millis(ms));
+            }
+        });
+
         let snap_clone = Arc::clone(&snapshot);
         let toast_clone = Arc::clone(&last_toast);
         let stop_clone = Arc::clone(&stop);
 
         thread::spawn(move || {
-            worker_loop(snap_clone, toast_clone, rx, stop_clone);
+            worker_loop(
+                snap_clone,
+                toast_clone,
+                rx,
+                stop_clone,
+                fg_app,
+                fg_poll_ms,
+            );
         });
 
         Self {
@@ -150,33 +198,57 @@ fn set_toast(toast: &Arc<RwLock<Option<(String, bool)>>>, msg: impl Into<String>
     }
 }
 
+struct WorkerState {
+    focus_key: Option<(usize, usize)>,
+    focus_trace: Vec<f32>,
+    poll_adc: bool,
+}
+
 fn worker_loop(
     snapshot: Arc<RwLock<Snapshot>>,
     toast: Arc<RwLock<Option<(String, bool)>>>,
     rx: crossbeam_channel::Receiver<DeviceCommand>,
     stop: Arc<AtomicBool>,
+    fg_app: Arc<RwLock<Option<ForegroundApp>>>,
+    fg_poll_ms: Arc<AtomicU64>,
 ) {
     let mut unlocked = UnlockedBoards::load(&unlocked_boards_path());
     let mut settings = AppSettings::load(&settings_path());
     let mut switcher_cfg = SwitcherConfig::load(&switcher_config_path());
+    fg_poll_ms.store(switcher_cfg.poll_ms.max(100), Ordering::Relaxed);
     let mut switcher_state = SwitcherState::default();
     let mut last_switch_poll = Instant::now();
+    let mut wstate = WorkerState {
+        focus_key: None,
+        focus_trace: Vec::with_capacity(FOCUS_TRACE_LEN),
+        poll_adc: false,
+    };
 
     while !stop.load(Ordering::Relaxed) {
         // Attempt connection
         let mut kb = match Mad68::open(true, false, settings.led_gain, &unlocked) {
             Ok(kb) => kb,
             Err(err) => {
+                let ifaces = find_interfaces().unwrap_or_default();
+                let fg_exe = fg_app
+                    .read()
+                    .ok()
+                    .and_then(|g| g.as_ref().map(|a| a.exe.clone()));
                 if let Ok(mut s) = snapshot.write() {
                     s.connected = false;
                     s.in_bootloader = matches!(err, crate::device::DeviceError::InBootloader);
                     s.error = Some(err.to_string());
+                    s.hid_interfaces = ifaces;
+                    s.foreground_exe = fg_exe;
                 }
-                // Drain pending commands while disconnected
                 while let Ok(cmd) = rx.try_recv() {
                     match cmd {
                         DeviceCommand::UnlockBoard(pid) => {
                             unlocked.set_unlocked(pid, true);
+                            let _ = unlocked.save(&unlocked_boards_path());
+                        }
+                        DeviceCommand::LockBoard(pid) => {
+                            unlocked.set_unlocked(pid, false);
                             let _ = unlocked.save(&unlocked_boards_path());
                         }
                         DeviceCommand::SetGain(g) => {
@@ -185,11 +257,22 @@ fn worker_loop(
                         }
                         DeviceCommand::ReloadSwitcher => {
                             switcher_cfg = SwitcherConfig::load(&switcher_config_path());
+                            fg_poll_ms.store(switcher_cfg.poll_ms.max(100), Ordering::Relaxed);
+                        }
+                        DeviceCommand::SetFocusKey(k) => {
+                            if wstate.focus_key != k {
+                                wstate.focus_key = k;
+                                wstate.focus_trace.clear();
+                            }
+                        }
+                        DeviceCommand::SetPollAdc(p) => wstate.poll_adc = p,
+                        DeviceCommand::RunDiagnostic { tx, .. } => {
+                            let _ = tx.send(Err("Keyboard is not connected".into()));
                         }
                         _ => {}
                     }
                 }
-                thread::sleep(Duration::from_millis(600));
+                thread::sleep(Duration::from_millis(500));
                 continue;
             }
         };
@@ -197,6 +280,7 @@ fn worker_loop(
         // Connected: read initial full config
         let populated = kb.populated_mask();
         let full_cfg = kb.read_full_config().ok();
+        let ifaces = find_interfaces().unwrap_or_default();
         {
             if let Ok(mut s) = snapshot.write() {
                 s.connected = true;
@@ -212,7 +296,10 @@ fn worker_loop(
                 let total = kb.total_keys();
                 s.trip_mm = vec![0.0; total];
                 s.peak_mm = vec![0.0; total];
+                s.adc_raw.clear();
+                s.hid_interfaces = ifaces;
                 s.config = full_cfg;
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
         }
 
@@ -232,6 +319,8 @@ fn worker_loop(
                     &mut unlocked,
                     &mut settings,
                     &mut switcher_cfg,
+                    &fg_poll_ms,
+                    &mut wstate,
                 );
                 if let Err(msg) = res {
                     set_toast(&toast, msg, true);
@@ -240,9 +329,29 @@ fn worker_loop(
                 }
             }
 
-            // 2. Poll live trip telemetry (~30ms)
+            // 2. High-rate burst sampling for focused key oscilloscope trace
+            if let Some((fr, fc)) = wstate.focus_key {
+                for _ in 0..FOCUS_BURST_SAMPLES {
+                    if let Ok(mm) = kb.read_trip_mm(fr, fc) {
+                        wstate.focus_trace.push(mm);
+                        if wstate.focus_trace.len() > FOCUS_TRACE_LEN {
+                            let excess = wstate.focus_trace.len() - FOCUS_TRACE_LEN;
+                            wstate.focus_trace.drain(0..excess);
+                        }
+                    } else {
+                        break;
+                    }
+                }
+            }
+
+            // 3. Poll live trip telemetry (~30ms)
             match kb.read_trip_raw() {
                 Ok(raw) => {
+                    let adc_opt = if wstate.poll_adc {
+                        kb.read_adc_raw().ok()
+                    } else {
+                        None
+                    };
                     if let Ok(mut s) = snapshot.write() {
                         if s.trip_mm.len() != raw.len() {
                             s.trip_mm = vec![0.0; raw.len()];
@@ -255,6 +364,11 @@ fn worker_loop(
                                 s.peak_mm[i] = mm;
                             }
                         }
+                        if let Some(adc) = adc_opt {
+                            s.adc_raw = adc;
+                        }
+                        s.focus_key = wstate.focus_key;
+                        s.focus_trace = wstate.focus_trace.clone();
                     }
                 }
                 Err(_) => {
@@ -262,10 +376,10 @@ fn worker_loop(
                 }
             }
 
-            // 3. App Switcher evaluation
+            // 4. App Switcher evaluation (reads cached foreground window without blocking HID)
             if last_switch_poll.elapsed() >= Duration::from_millis(switcher_cfg.poll_ms.max(100)) {
                 last_switch_poll = Instant::now();
-                let fg = foreground_app();
+                let fg = fg_app.read().ok().and_then(|g| g.clone());
                 if let Ok(mut s) = snapshot.write() {
                     s.foreground_exe = fg.as_ref().map(|a| a.exe.clone());
                 }
@@ -274,9 +388,11 @@ fn worker_loop(
                         if let Ok(p) = profile_path(&profile_dir(), &target) {
                             if let Ok(prof) = Profile::load(&p) {
                                 if kb.apply_profile(&prof, FlashOp::Normal).is_ok() {
+                                    let cfg_opt = kb.read_full_config().ok();
                                     if let Ok(mut s) = snapshot.write() {
                                         s.active_profile = Some(target.clone());
-                                        s.config = kb.read_full_config().ok();
+                                        s.config = cfg_opt;
+                                        s.config_seq = s.config_seq.wrapping_add(1);
                                     }
                                     set_toast(&toast, format!("Switched to profile: {target}"), false);
                                 }
@@ -286,7 +402,7 @@ fn worker_loop(
                 }
             }
 
-            thread::sleep(Duration::from_millis(28));
+            thread::sleep(Duration::from_millis(if wstate.focus_key.is_some() { 16 } else { 28 }));
         }
     }
 }
@@ -307,6 +423,9 @@ fn coalesce_commands(cmds: Vec<DeviceCommand>) -> Vec<DeviceCommand> {
             DeviceCommand::SetGain(_) => {
                 out.retain(|c| !matches!(c, DeviceCommand::SetGain(_)));
             }
+            DeviceCommand::SetFocusKey(_) => {
+                out.retain(|c| !matches!(c, DeviceCommand::SetFocusKey(_)));
+            }
             DeviceCommand::SetActuation { indices, .. } => {
                 out.retain(|c| !matches!(c, DeviceCommand::SetActuation { indices: idx, .. } if idx == indices));
             }
@@ -323,6 +442,7 @@ fn coalesce_commands(cmds: Vec<DeviceCommand>) -> Vec<DeviceCommand> {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_command(
     kb: &mut Mad68,
     cmd: DeviceCommand,
@@ -330,19 +450,39 @@ fn handle_command(
     unlocked: &mut UnlockedBoards,
     settings: &mut AppSettings,
     switcher_cfg: &mut SwitcherConfig,
+    fg_poll_ms: &Arc<AtomicU64>,
+    wstate: &mut WorkerState,
 ) -> Result<Option<String>, String> {
     match cmd {
         DeviceCommand::RefreshConfig => {
             let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(None)
         }
         DeviceCommand::ResetPeaks => {
+            wstate.focus_trace.clear();
             if let Ok(mut s) = snapshot.write() {
                 s.peak_mm.fill(0.0);
+                s.focus_trace.clear();
             }
+            Ok(None)
+        }
+        DeviceCommand::SetFocusKey(k) => {
+            if wstate.focus_key != k {
+                wstate.focus_key = k;
+                wstate.focus_trace.clear();
+                if let Ok(mut s) = snapshot.write() {
+                    s.focus_key = k;
+                    s.focus_trace.clear();
+                }
+            }
+            Ok(None)
+        }
+        DeviceCommand::SetPollAdc(p) => {
+            wstate.poll_adc = p;
             Ok(None)
         }
         DeviceCommand::SetActuation { indices, mm } => {
@@ -475,6 +615,16 @@ fn handle_command(
             }
             Ok(Some("Keycode updated (EEPROM)".into()))
         }
+        DeviceCommand::SetKeycodes { layer, positions, keycode } => {
+            for (row, col) in positions {
+                kb.write_keycode(layer, row, col, keycode).map_err(|e| e.to_string())?;
+            }
+            let km = kb.read_keymap().map_err(|e| e.to_string())?;
+            if let Ok(mut s) = snapshot.write() {
+                if let Some(ref mut c) = s.config { c.keymap = km; }
+            }
+            Ok(Some("Keycodes updated (EEPROM)".into()))
+        }
         DeviceCommand::ApplyKeymap(km) => {
             kb.write_keymap(&km).map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
@@ -482,11 +632,38 @@ fn handle_command(
             }
             Ok(Some("Keymap written to keyboard".into()))
         }
+        DeviceCommand::ApplyProfileKeymap(name) => {
+            let p = profile_path(&profile_dir(), &name)?;
+            let prof = Profile::load(&p)?;
+            let want = prof
+                .to_keymap_bytes(kb.spec.layers, kb.spec.rows, kb.spec.cols)
+                .ok_or_else(|| "Profile has no compatible keymap for this board".to_string())?;
+            kb.write_keymap(&want).map_err(|e| e.to_string())?;
+            let km = kb.read_keymap().map_err(|e| e.to_string())?;
+            if let Ok(mut s) = snapshot.write() {
+                if let Some(ref mut c) = s.config { c.keymap = km; }
+                s.config_seq = s.config_seq.wrapping_add(1);
+            }
+            Ok(Some(format!("Keymap from '{name}' written to EEPROM")))
+        }
+        DeviceCommand::ResetKeymap => {
+            kb.dangerous = true;
+            let res = kb.reset_keymap();
+            kb.dangerous = false;
+            res.map_err(|e| e.to_string())?;
+            let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
+            if let Ok(mut s) = snapshot.write() {
+                s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
+            }
+            Ok(Some("Keymap reset to factory defaults".into()))
+        }
         DeviceCommand::SetAdvancedKey(ak) => {
             kb.write_advanced_key(&ak).map_err(|e| e.to_string())?;
             let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(Some("Advanced key updated".into()))
         }
@@ -495,6 +672,7 @@ fn handle_command(
             let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(Some("DKS updated".into()))
         }
@@ -503,6 +681,7 @@ fn handle_command(
             let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(Some("Hold/Click (MT) updated".into()))
         }
@@ -528,6 +707,7 @@ fn handle_command(
                     s.onboard_profile = Some(name.clone());
                 }
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(Some(if flash_op == FlashOp::EraseAndWrite {
                 format!("Profile '{name}' saved to keyboard flash")
@@ -551,9 +731,13 @@ fn handle_command(
             let res = kb.finish_calibration();
             kb.dangerous = false;
             res.map_err(|e| e.to_string())?;
+            kb.clear_populated_cache();
+            let populated = kb.populated_mask();
             let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
+                s.populated = populated;
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(Some("Calibration finished".into()))
         }
@@ -562,9 +746,13 @@ fn handle_command(
             let res = kb.factory_reset();
             kb.dangerous = false;
             res.map_err(|e| e.to_string())?;
+            kb.clear_populated_cache();
+            let populated = kb.populated_mask();
             let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
+                s.populated = populated;
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(Some("Keyboard factory reset complete".into()))
         }
@@ -578,6 +766,23 @@ fn handle_command(
                 s.read_only_reason = None;
             }
             Ok(Some("Board unlocked for writing".into()))
+        }
+        DeviceCommand::LockBoard(pid) => {
+            unlocked.set_unlocked(pid, false);
+            let _ = unlocked.save(&unlocked_boards_path());
+            if !kb.spec.verified {
+                kb.writes = false;
+                let reason = format!(
+                    "{} ({:#06x}) is unverified; opened read-only",
+                    kb.spec.name, kb.spec.product_id
+                );
+                kb.read_only_reason = Some(reason.clone());
+                if let Ok(mut s) = snapshot.write() {
+                    s.read_only = true;
+                    s.read_only_reason = Some(reason);
+                }
+            }
+            Ok(Some("Board locked (read-only)".into()))
         }
         DeviceCommand::SetGain(g) => {
             settings.led_gain = g;
@@ -594,15 +799,31 @@ fn handle_command(
             let cfg = kb.read_full_config().map_err(|e| e.to_string())?;
             if let Ok(mut s) = snapshot.write() {
                 s.config = Some(cfg);
+                s.config_seq = s.config_seq.wrapping_add(1);
             }
             Ok(Some("Backup restored".into()))
         }
+        DeviceCommand::RunDiagnostic { write_probe, tx } => {
+            let res = save_and_prepare_diagnostic(kb, write_probe);
+            let _ = tx.send(res);
+            Ok(None)
+        }
         DeviceCommand::ReloadSwitcher => {
             *switcher_cfg = SwitcherConfig::load(&switcher_config_path());
+            fg_poll_ms.store(switcher_cfg.poll_ms.max(100), Ordering::Relaxed);
             Ok(None)
         }
         DeviceCommand::Respond(tx, inner) => {
-            let r = handle_command(kb, *inner, snapshot, unlocked, settings, switcher_cfg);
+            let r = handle_command(
+                kb,
+                *inner,
+                snapshot,
+                unlocked,
+                settings,
+                switcher_cfg,
+                fg_poll_ms,
+                wstate,
+            );
             let msg = match &r {
                 Ok(Some(m)) => Ok(m.clone()),
                 Ok(None) => Ok("Done".into()),

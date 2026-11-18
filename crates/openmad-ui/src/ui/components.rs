@@ -1,14 +1,16 @@
 //! Reusable UI components for OpenMAD-Rust.
 
-use crate::app::Message;
+use crate::app::{KeyPickerTab, Message};
+use crate::i18n::Lang;
 use crate::theme::{
-    badge_style, card_style, pill_style, secondary_button_style, segmented_bar_style,
+    badge_style, card_style, input_style, pill_style, secondary_button_style, segmented_bar_style,
     slider_style, tab_button_style, toggler_style, type_scale, with_alpha, FONT_MEDIUM,
     FONT_SEMIBOLD, SP_LG, SP_MD, SP_SM, SP_XL, SP_XS, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use crate::ui::icons::{icon, Icon};
-use iced::widget::{button, column, container, row, slider, text, toggler, Row, Space};
+use iced::widget::{button, column, container, row, slider, text, text_input, toggler, Column, Row, Space};
 use iced::{Alignment, Color, Element, Length};
+use openmad_core::keycodes::{KEYBOARD_PICKER_CODES, LAYER_PICKER_CODES, SYSTEM_PICKER_CODES};
 
 pub fn card<'a>(
     title: impl Into<String>,
@@ -32,7 +34,9 @@ pub fn card<'a>(
         );
     }
 
-    let mut header_row = row![header_left, Space::with_width(Length::Fill)]
+    let header_left = header_left.width(Length::Fill);
+    let mut header_row = row![header_left]
+        .spacing(SP_MD)
         .align_y(Alignment::Center);
     if let Some(act) = actions {
         header_row = header_row.push(act);
@@ -215,4 +219,109 @@ pub fn empty_state<'a>(
         .center_x(Length::Fill)
         .style(card_style)
         .into()
+}
+
+pub fn keycode_picker<'a>(
+    lang: Lang,
+    pick_tab: KeyPickerTab,
+    search: &'a str,
+    accent: Color,
+    on_tab: fn(KeyPickerTab) -> Message,
+    on_search: fn(String) -> Message,
+    on_pick: fn(u16) -> Message,
+) -> Element<'a, Message> {
+    let pick_items = [
+        (KeyPickerTab::Keyboard, lang.t("Teclas Padrão", "Keyboard")),
+        (KeyPickerTab::System, lang.t("Sistema / Mídia", "System / Media")),
+        (KeyPickerTab::Macro, "Macros"),
+        (KeyPickerTab::Layer, lang.t("Camadas (Fn)", "Layers (Fn)")),
+    ];
+    let pick_seg = segmented(&pick_items, pick_tab, accent, on_tab);
+
+    let search_box = row![
+        icon(Icon::Search, 14, TEXT_MUTED),
+        text_input(
+            lang.t(
+                "Buscar tecla (ex: Enter, KP7, Vol, F12)…",
+                "Search keycode (e.g. Enter, KP7, Vol, F12)…",
+            ),
+            search,
+        )
+        .on_input(on_search)
+        .padding([6, 10])
+        .size(type_scale::CAPTION + 1)
+        .style(input_style(accent)),
+    ]
+    .spacing(8)
+    .align_y(Alignment::Center)
+    .width(Length::Fixed(270.0));
+
+    let q = search.trim().to_lowercase();
+    let all_codes: Vec<(u16, String)> = match pick_tab {
+        KeyPickerTab::Keyboard => KEYBOARD_PICKER_CODES
+            .iter()
+            .map(|&(k, lbl)| (k, lbl.to_string()))
+            .collect(),
+        KeyPickerTab::System => SYSTEM_PICKER_CODES
+            .iter()
+            .map(|&(k, lbl)| (k, lbl.to_string()))
+            .collect(),
+        KeyPickerTab::Macro => (0..16u16).map(|i| (0x7700 + i, format!("M{i}"))).collect(),
+        KeyPickerTab::Layer => LAYER_PICKER_CODES
+            .iter()
+            .map(|&(k, lbl)| (k, lbl.to_string()))
+            .collect(),
+    };
+
+    let codes: Vec<(u16, String)> = if q.is_empty() {
+        all_codes
+    } else {
+        all_codes
+            .into_iter()
+            .filter(|(_, lbl)| lbl.to_lowercase().contains(&q))
+            .collect()
+    };
+
+    let mut grid = Column::new().spacing(6);
+    if codes.is_empty() {
+        grid = grid.push(
+            text(lang.t(
+                "Nenhuma tecla encontrada para esta busca.",
+                "No keycodes match your search.",
+            ))
+            .size(type_scale::BODY)
+            .color(TEXT_MUTED),
+        );
+    } else {
+        const COLS: usize = 10;
+        for chunk in codes.chunks(COLS) {
+            let mut r = Row::new().spacing(6);
+            for (kc, label) in chunk {
+                r = r.push(
+                    button(
+                        text(label.clone())
+                            .size(type_scale::CAPTION)
+                            .font(FONT_MEDIUM),
+                    )
+                    .width(Length::Fill)
+                    .padding([7, 6])
+                    .style(secondary_button_style)
+                    .on_press(on_pick(*kc)),
+                );
+            }
+            for _ in chunk.len()..COLS {
+                r = r.push(Space::with_width(Length::Fill));
+            }
+            grid = grid.push(r);
+        }
+    }
+
+    column![
+        row![pick_seg, Space::with_width(Length::Fill), search_box]
+            .spacing(SP_SM)
+            .align_y(Alignment::Center),
+        grid,
+    ]
+    .spacing(SP_MD)
+    .into()
 }

@@ -40,3 +40,7 @@ pub fn unlocked_boards_path() -> PathBuf {
 pub fn led_gain_path() -> PathBuf {
     data_dir().join("led_gain.json")
 }
+
+pub fn reports_dir() -> PathBuf {
+    data_dir().join("reports")
+}

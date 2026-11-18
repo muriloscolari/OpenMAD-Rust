@@ -1,6 +1,7 @@
 pub mod backup;
 pub mod device;
 pub mod devices;
+pub mod diagnostics;
 pub mod features;
 pub mod keycodes;
 pub mod paths;

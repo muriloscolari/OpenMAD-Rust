@@ -1,14 +1,16 @@
 //! Interactive 3D-sculpted keyboard matrix widget using iced::widget::Canvas.
 
 use crate::theme::{
-    with_alpha, BORDER_STRONG, BORDER_SUBTLE, FONT_INTER, FONT_MEDIUM, FONT_SEMIBOLD, GREEN_OK,
-    TEXT_PRIMARY, TEXT_SECONDARY,
+    with_alpha, AMBER_WARN, BORDER_STRONG, BORDER_SUBTLE, FONT_INTER, FONT_MEDIUM, FONT_SEMIBOLD,
+    GREEN_OK, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use crate::widgets::color_picker::hsv_to_rgb;
 use iced::mouse;
 use iced::widget::canvas::{self, Canvas, Frame, Geometry, Path, Stroke, Text};
 use iced::{Color, Element, Length, Point, Rectangle, Renderer, Size, Theme};
+use openmad_core::features::{AdvancedKey, RapidTrigger};
 use openmad_core::keycodes;
+use openmad_core::protocol::AdvancedKeyMode;
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy)]
@@ -182,10 +184,15 @@ pub struct KeyboardCanvas<'a> {
     pub layer: usize,
     pub keymap: &'a [u8],
     pub actuation: &'a [f32],
+    pub rapid_trigger: &'a [RapidTrigger],
     pub trip_mm: &'a [f32],
+    pub adc_raw: &'a [u16],
+    pub calibration_view: bool,
     pub key_colors: &'a [[u8; 3]],
     pub light_effect: u8,
     pub light_color: [u8; 3],
+    pub advanced_keys: &'a [AdvancedKey],
+    pub adv_pair_highlight: Option<((usize, usize), (usize, usize))>,
     pub accent: Color,
 }
 
@@ -410,14 +417,58 @@ impl<'a, M> canvas::Program<M> for KeyboardProgram<'a, M> {
                 }
             }
 
-            // Performance heatmap subtle tint
+            // Performance heatmap or calibration tint
             if self.data.mode == BoardViewMode::Performance {
-                if let Some(&apc) = self.data.actuation.get(idx) {
+                if self.data.calibration_view {
+                    let is_cal = self.data.populated.get(idx).copied().unwrap_or(false);
+                    let cal_tint = if is_cal { GREEN_OK } else { AMBER_WARN };
+                    top_bg = Color::from_rgb(
+                        top_bg.r * 0.80 + cal_tint.r * 0.20,
+                        top_bg.g * 0.80 + cal_tint.g * 0.20,
+                        top_bg.b * 0.80 + cal_tint.b * 0.20,
+                    );
+                } else if let Some(&apc) = self.data.actuation.get(idx) {
                     let heat = actuation_heatmap_color(apc);
                     top_bg = Color::from_rgb(
                         top_bg.r * 0.84 + heat.r * 0.16,
                         top_bg.g * 0.84 + heat.g * 0.16,
                         top_bg.b * 0.84 + heat.b * 0.16,
+                    );
+                }
+            }
+
+            // Advanced mode bound-key badge & active pair highlight
+            let mut adv_badge: Option<(&'static str, Color)> = None;
+            if self.data.mode == BoardViewMode::Advanced {
+                for ak in self.data.advanced_keys {
+                    if !ak.is_active() {
+                        continue;
+                    }
+                    let is_k1 = ak.key1_row as usize == r && ak.key1_col as usize == c;
+                    let is_k2 = ak.key2_row as usize == r && ak.key2_col as usize == c;
+                    if is_k1 || is_k2 {
+                        let lbl = match ak.mode {
+                            AdvancedKeyMode::Rs => "RS",
+                            AdvancedKeyMode::Oks => "OKS",
+                            AdvancedKeyMode::None => "",
+                            _ => "SOCD",
+                        };
+                        adv_badge = Some((lbl, AMBER_WARN));
+                        break;
+                    }
+                }
+                if let Some(((k1r, k1c), (k2r, k2c))) = self.data.adv_pair_highlight {
+                    if r == k1r && c == k1c {
+                        adv_badge = Some(("K1", self.data.accent));
+                    } else if r == k2r && c == k2c {
+                        adv_badge = Some(("K2", GREEN_OK));
+                    }
+                }
+                if let Some((_, col)) = adv_badge {
+                    top_bg = Color::from_rgb(
+                        top_bg.r * 0.72 + col.r * 0.28,
+                        top_bg.g * 0.72 + col.g * 0.28,
+                        top_bg.b * 0.72 + col.b * 0.28,
                     );
                 }
             }
@@ -450,11 +501,22 @@ impl<'a, M> canvas::Program<M> for KeyboardProgram<'a, M> {
                         frame.fill(&bar, Color::from_rgba(0.188, 0.820, 0.345, 0.45));
                     }
                 }
+                if !self.data.calibration_view
+                    && self.data.rapid_trigger.get(idx).is_some_and(|rt| rt.enabled)
+                {
+                    let dot = Path::circle(
+                        Point::new(top_rect.x + top_rect.width - 6.0, top_rect.y + 6.0),
+                        2.5,
+                    );
+                    frame.fill(&dot, Color::from_rgb(0.392, 0.824, 1.0));
+                }
             }
 
             // Outer selection / hover stroke
             let border_color = if is_selected {
                 self.data.accent
+            } else if let Some((_, col)) = adv_badge {
+                col
             } else if is_hovered {
                 BORDER_STRONG
             } else {
@@ -464,7 +526,7 @@ impl<'a, M> canvas::Program<M> for KeyboardProgram<'a, M> {
                 &cap_path,
                 Stroke::default()
                     .with_color(border_color)
-                    .with_width(if is_selected { 2.0 } else { 1.0 }),
+                    .with_width(if is_selected || adv_badge.is_some() { 2.0 } else { 1.0 }),
             );
 
             // Key legend
@@ -474,7 +536,8 @@ impl<'a, M> canvas::Program<M> for KeyboardProgram<'a, M> {
                 .map(|&kc| keycodes::label(kc))
                 .unwrap_or_else(|| format!("{r},{c}"));
 
-            let label_y = if self.data.mode == BoardViewMode::Performance {
+            let has_sub_line = self.data.mode == BoardViewMode::Performance || adv_badge.is_some();
+            let label_y = if has_sub_line {
                 top_rect.y + top_rect.height * 0.35
             } else {
                 top_rect.y + top_rect.height * 0.50
@@ -491,8 +554,38 @@ impl<'a, M> canvas::Program<M> for KeyboardProgram<'a, M> {
                 ..Text::default()
             });
 
-            if self.data.mode == BoardViewMode::Performance {
-                if let Some(&apc) = self.data.actuation.get(idx) {
+            if let Some((badge_txt, badge_col)) = adv_badge {
+                frame.fill_text(Text {
+                    content: badge_txt.to_string(),
+                    position: Point::new(
+                        top_rect.x + top_rect.width * 0.5,
+                        top_rect.y + top_rect.height * 0.74,
+                    ),
+                    color: badge_col,
+                    size: 8.5.into(),
+                    font: FONT_SEMIBOLD,
+                    horizontal_alignment: iced::alignment::Horizontal::Center,
+                    vertical_alignment: iced::alignment::Vertical::Center,
+                    ..Text::default()
+                });
+            } else if self.data.mode == BoardViewMode::Performance {
+                if self.data.calibration_view {
+                    if let Some(&adc) = self.data.adc_raw.get(idx) {
+                        frame.fill_text(Text {
+                            content: format!("{adc}"),
+                            position: Point::new(
+                                top_rect.x + top_rect.width * 0.5,
+                                top_rect.y + top_rect.height * 0.74,
+                            ),
+                            color: TEXT_SECONDARY,
+                            size: 8.5.into(),
+                            font: FONT_INTER,
+                            horizontal_alignment: iced::alignment::Horizontal::Center,
+                            vertical_alignment: iced::alignment::Vertical::Center,
+                            ..Text::default()
+                        });
+                    }
+                } else if let Some(&apc) = self.data.actuation.get(idx) {
                     let trip = self.data.trip_mm.get(idx).copied().unwrap_or(0.0);
                     let sub = if trip > 0.04 {
                         format!("{trip:.2}")

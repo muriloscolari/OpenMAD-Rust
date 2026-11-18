@@ -23,6 +23,7 @@ jobs:
           sudo apt-get install -y libhidapi-dev libudev-dev libgtk-3-dev libayatana-appindicator3-dev libdbus-1-dev libxdo-dev pkg-config
       - name: Run tests & build release
         run: |
+          cargo clippy --workspace --all-targets -- -D warnings
           cargo test --workspace
           cargo build --release --bin openmad
       - name: Package Linux artifacts
@@ -30,7 +31,10 @@ jobs:
           mkdir -p dist
           cp target/release/openmad dist/openmad-linux-x86_64
           VERSION="${GITHUB_REF_NAME#v}"
-          if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then VERSION="0.1.0"; fi
+          if [[ -z "$VERSION" || "$VERSION" == "main" ]]; then
+            VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+            VERSION="${VERSION:-0.2.0}"
+          fi
           bash packaging/debian/build-deb.sh "$VERSION"
       - uses: actions/upload-artifact@v4
         with:

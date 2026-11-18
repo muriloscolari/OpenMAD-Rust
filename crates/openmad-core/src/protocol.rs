@@ -508,6 +508,6 @@ mod tests {
     fn test_keymap_offsets() {
         assert_eq!(keymap_size(5, 15, 4), 600);
         assert_eq!(keymap_size(5, 14, 4), 560);
-        assert_eq!(keymap_offset(1, 2, 3, 5, 15), ((1 * 5 + 2) * 15 + 3) * 2);
+        assert_eq!(keymap_offset(1, 2, 3, 5, 15), ((5 + 2) * 15 + 3) * 2);
     }
 }

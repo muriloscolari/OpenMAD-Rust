@@ -1,17 +1,17 @@
-//! Keymap remapping page with layer selector, search bar, and categorized keycode grid.
+//! Keymap remapping page with layer selector, profile keymap sync, search bar, and categorized keycode grid.
 
-use crate::app::{KeyPickerTab, Message, OpenMadApp};
+use crate::app::{Message, OpenMadApp};
 use crate::theme::{
     contrast_on, input_style, primary_button_style, secondary_button_style, type_scale,
-    FONT_MEDIUM, SP_MD, SP_SM, TEXT_MUTED, TEXT_SECONDARY,
+    AMBER_WARN, FONT_MEDIUM, GREEN_OK, SP_MD, SP_SM, TEXT_MUTED, TEXT_SECONDARY,
 };
-use crate::ui::components::{badge, card, segmented};
+use crate::ui::components::{badge, card, keycode_picker, segmented};
 use crate::ui::icons::{icon, Icon};
-use iced::widget::{button, column, row, text, text_input, Column, Row, Space};
+use iced::widget::{button, column, row, text, text_input, Space};
 use iced::{Alignment, Color, Element, Length};
-use openmad_core::keycodes::{
-    self, KEYBOARD_PICKER_CODES, LAYER_PICKER_CODES, SYSTEM_PICKER_CODES,
-};
+use openmad_core::keycodes;
+use openmad_core::paths::profile_dir;
+use openmad_core::profile::{profile_path, Profile};
 
 impl OpenMadApp {
     pub fn view_keys_page(&self, accent: Color) -> Element<'_, Message> {
@@ -41,10 +41,7 @@ impl OpenMadApp {
                 .unwrap_or(0);
             let lbl = keycodes::label(cur_kc);
             badge(
-                format!(
-                    "{}: ({r},{c}) → {lbl}",
-                    l.t("Atual", "Current")
-                ),
+                format!("{}: ({r},{c}) → {lbl}", l.t("Atual", "Current")),
                 accent,
             )
         } else {
@@ -54,94 +51,66 @@ impl OpenMadApp {
             )
         };
 
-        let pick_items = [
-            (KeyPickerTab::Keyboard, l.t("Teclas Padrão", "Keyboard")),
-            (KeyPickerTab::System, l.t("Sistema / Mídia", "System / Media")),
-            (KeyPickerTab::Macro, "Macros"),
-            (KeyPickerTab::Layer, l.t("Camadas (Fn)", "Layers (Fn)")),
-        ];
-        let pick_seg = segmented(&pick_items, self.pick_tab, accent, Message::SelectKeyPickerTab);
-
-        let search_box = row![
-            icon(Icon::Search, 14, TEXT_MUTED),
-            text_input(
-                l.t("Buscar tecla (ex: Enter, Vol, F12)…", "Search keycode (e.g. Enter, Vol, F12)…"),
-                &self.keycode_search,
-            )
-            .on_input(Message::KeycodeSearchChanged)
-            .padding([6, 10])
-            .size(type_scale::CAPTION + 1)
-            .style(input_style(accent)),
-        ]
-        .spacing(8)
-        .align_y(Alignment::Center)
-        .width(Length::Fixed(270.0));
-
-        let q = self.keycode_search.trim().to_lowercase();
-        let all_codes: Vec<(u16, String)> = match self.pick_tab {
-            KeyPickerTab::Keyboard => KEYBOARD_PICKER_CODES
-                .iter()
-                .map(|&(k, lbl)| (k, lbl.to_string()))
-                .collect(),
-            KeyPickerTab::System => SYSTEM_PICKER_CODES
-                .iter()
-                .map(|&(k, lbl)| (k, lbl.to_string()))
-                .collect(),
-            KeyPickerTab::Macro => (0..16u16).map(|i| (0x7700 + i, format!("M{i}"))).collect(),
-            KeyPickerTab::Layer => LAYER_PICKER_CODES
-                .iter()
-                .map(|&(k, lbl)| (k, lbl.to_string()))
-                .collect(),
-        };
-
-        let codes: Vec<(u16, String)> = if q.is_empty() {
-            all_codes
-        } else {
-            all_codes
-                .into_iter()
-                .filter(|(_, lbl)| lbl.to_lowercase().contains(&q))
-                .collect()
-        };
-
-        let mut grid = Column::new().spacing(6);
-        if codes.is_empty() {
-            grid = grid.push(
-                text(l.t(
-                    "Nenhuma tecla encontrada para esta busca.",
-                    "No keycodes match your search.",
-                ))
-                .size(type_scale::BODY)
-                .color(TEXT_MUTED),
-            );
-        } else {
-            for chunk in codes.chunks(10) {
-                let mut r = Row::new().spacing(6);
-                for (kc, label) in chunk {
-                    r = r.push(
-                        button(
-                            text(label.clone())
-                                .size(type_scale::CAPTION)
-                                .font(FONT_MEDIUM),
-                        )
-                        .width(Length::Fill)
-                        .padding([7, 6])
-                        .style(secondary_button_style)
-                        .on_press(Message::AssignKeycode(*kc)),
-                    );
+        // Check selected profile's keymap status against live keyboard keymap
+        let mut prof_km_diff: Option<usize> = None;
+        let mut has_prof_km = false;
+        if let (Some(ref prof_name), Some(ref cfg)) = (&self.selected_profile, &self.snap.config) {
+            if let Ok(p) = profile_path(&profile_dir(), prof_name) {
+                if let Ok(prof) = Profile::load(&p) {
+                    if prof.keymap.is_some() {
+                        has_prof_km = true;
+                        prof_km_diff = prof.keymap_diff_against(
+                            &cfg.keymap,
+                            self.snap.board.layers,
+                            self.snap.board.rows,
+                            self.snap.board.cols,
+                        );
+                    }
                 }
-                for _ in chunk.len()..10 {
-                    r = r.push(Space::with_width(Length::Fill));
-                }
-                grid = grid.push(r);
             }
         }
 
+        let km_status_badge = if !has_prof_km {
+            badge(
+                l.t("Perfil sem keymap salvo", "No keymap in profile"),
+                TEXT_MUTED,
+            )
+        } else if let Some(0) = prof_km_diff {
+            badge(l.t("Keymap sincronizado", "Keymap in sync"), GREEN_OK)
+        } else if let Some(n) = prof_km_diff {
+            badge(
+                format!(
+                    "{n} {}",
+                    l.t("tecla(s) diferem do perfil", "key(s) differ from profile")
+                ),
+                AMBER_WARN,
+            )
+        } else {
+            badge(
+                l.t("Layout incompatível", "Incompatible layout"),
+                AMBER_WARN,
+            )
+        };
+
         let header_actions = row![
             selected_badge,
+            km_status_badge,
+            button(
+                row![
+                    icon(Icon::Download, 13, crate::theme::TEXT_PRIMARY),
+                    text(l.t("Capturar p/ Perfil", "Capture to Profile"))
+                        .size(type_scale::CAPTION + 1),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 11])
+            .style(secondary_button_style)
+            .on_press(Message::CaptureProfileKeymap),
             button(
                 row![
                     icon(Icon::HardDrive, 13, contrast_on(accent)),
-                    text(l.t("Aplicar Keymap (EEPROM)", "Apply Keymap (EEPROM)"))
+                    text(l.t("Aplicar do Perfil (EEPROM)", "Apply Profile Keymap"))
                         .size(type_scale::CAPTION + 1)
                         .font(FONT_MEDIUM),
                 ]
@@ -150,10 +119,43 @@ impl OpenMadApp {
             )
             .padding([6, 12])
             .style(primary_button_style(accent))
-            .on_press(Message::ApplyFullKeymap),
+            .on_press(Message::ApplyProfileKeymap),
         ]
         .spacing(8)
         .align_y(Alignment::Center);
+
+        let custom_hex_row = row![
+            text(l.t("Código HEX personalizado:", "Custom HEX keycode:"))
+                .size(type_scale::CAPTION + 1)
+                .color(TEXT_SECONDARY),
+            text_input("0x0004", &self.custom_hex_input)
+                .on_input(Message::CustomHexInputChanged)
+                .on_submit(Message::AssignCustomHexKeycode)
+                .width(Length::Fixed(105.0))
+                .padding([5, 9])
+                .size(type_scale::CAPTION + 1)
+                .style(input_style(accent)),
+            button(
+                text(l.t("Atribuir HEX", "Assign HEX"))
+                    .size(type_scale::CAPTION + 1)
+                    .font(FONT_MEDIUM),
+            )
+            .padding([6, 12])
+            .style(secondary_button_style)
+            .on_press(Message::AssignCustomHexKeycode),
+        ]
+        .spacing(8)
+        .align_y(Alignment::Center);
+
+        let picker = keycode_picker(
+            l,
+            self.pick_tab,
+            &self.keycode_search,
+            accent,
+            Message::SelectKeyPickerTab,
+            Message::KeycodeSearchChanged,
+            Message::KeycodePicked,
+        );
 
         let body = column![
             row![
@@ -163,12 +165,11 @@ impl OpenMadApp {
                     .color(TEXT_SECONDARY),
                 layer_seg,
                 Space::with_width(Length::Fill),
-                search_box,
+                custom_hex_row,
             ]
             .spacing(SP_SM)
             .align_y(Alignment::Center),
-            pick_seg,
-            grid,
+            picker,
         ]
         .spacing(SP_MD);
 
@@ -176,8 +177,8 @@ impl OpenMadApp {
             l.t("Remapear Teclas", "Keymap Assignment"),
             Some(
                 l.t(
-                    "Clique em uma tecla no teclado acima e escolha a nova função abaixo. Gravado diretamente na EEPROM.",
-                    "Select a key on the keyboard above, then click its new keycode below (writes to EEPROM).",
+                    "Clique em uma ou mais teclas acima e escolha a nova função abaixo (grava na EEPROM). Use Capturar/Aplicar para salvar keymaps por perfil.",
+                    "Select key(s) on the keyboard above and pick a new keycode below (writes to EEPROM). Use Capture/Apply to manage per-profile keymaps.",
                 )
                 .to_string(),
             ),

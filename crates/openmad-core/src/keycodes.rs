@@ -108,6 +108,24 @@ pub fn basic_name(kc: u16) -> Option<&'static str> {
         0x0050 => "Lft",
         0x0051 => "Dn",
         0x0052 => "Up",
+        0x0053 => "NumLk",
+        0x0054 => "KP/",
+        0x0055 => "KP*",
+        0x0056 => "KP-",
+        0x0057 => "KP+",
+        0x0058 => "KPEnt",
+        0x0059 => "KP1",
+        0x005A => "KP2",
+        0x005B => "KP3",
+        0x005C => "KP4",
+        0x005D => "KP5",
+        0x005E => "KP6",
+        0x005F => "KP7",
+        0x0060 => "KP8",
+        0x0061 => "KP9",
+        0x0062 => "KP0",
+        0x0063 => "KP.",
+        0x0064 => "NUBS",
         0x0065 => "App",
         0x0068 => "F13",
         0x0069 => "F14",
@@ -186,7 +204,12 @@ pub const KEYBOARD_PICKER_CODES: &[(u16, &str)] = &[
     (0x0052, "Up"), (0x0051, "Dn"), (0x0050, "Lft"), (0x004F, "Rgt"),
     (0x0049, "Ins"), (0x004C, "Del"), (0x004A, "Home"), (0x004D, "End"),
     (0x004B, "PgUp"), (0x004E, "PgDn"), (0x0046, "PrtSc"), (0x0047, "ScrLk"),
-    (0x0048, "Pause"), (0x0065, "App"),
+    (0x0048, "Pause"), (0x0065, "App"), (0x0064, "NUBS"),
+    (0x0053, "NumLk"), (0x0054, "KP/"), (0x0055, "KP*"), (0x0056, "KP-"),
+    (0x0057, "KP+"), (0x0058, "KPEnt"), (0x005F, "KP7"), (0x0060, "KP8"),
+    (0x0061, "KP9"), (0x005C, "KP4"), (0x005D, "KP5"), (0x005E, "KP6"),
+    (0x0059, "KP1"), (0x005A, "KP2"), (0x005B, "KP3"), (0x0062, "KP0"),
+    (0x0063, "KP."),
 ];
 
 pub const SYSTEM_PICKER_CODES: &[(u16, &str)] = &[
@@ -221,4 +244,81 @@ pub fn decode_keymap(keymap: &[u8], layer: usize, rows: usize, cols: usize) -> V
         out.push(row_vec);
     }
     out
+}
+
+pub fn decode_all_layers(keymap: &[u8], layers: usize, rows: usize, cols: usize) -> Vec<Vec<Vec<u16>>> {
+    (0..layers)
+        .map(|l| decode_keymap(keymap, l, rows, cols))
+        .collect()
+}
+
+pub fn encode_all_layers(grid: &[Vec<Vec<u16>>], layers: usize, rows: usize, cols: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(layers * rows * cols * 2);
+    for l in 0..layers {
+        for r in 0..rows {
+            for c in 0..cols {
+                let kc = grid
+                    .get(l)
+                    .and_then(|lr| lr.get(r))
+                    .and_then(|row| row.get(c))
+                    .copied()
+                    .unwrap_or(0);
+                out.extend_from_slice(&kc.to_be_bytes());
+            }
+        }
+    }
+    out
+}
+
+pub fn keymap_diff_count(a: &[u8], b: &[u8]) -> usize {
+    let n = a.len().min(b.len());
+    (0..n)
+        .step_by(2)
+        .filter(|&i| i + 1 < n && (a[i] != b[i] || a[i + 1] != b[i + 1]))
+        .count()
+}
+
+pub fn all_searchable_codes() -> Vec<(u16, String)> {
+    let mut out: Vec<(u16, String)> = KEYBOARD_PICKER_CODES
+        .iter()
+        .map(|&(k, lbl)| (k, lbl.to_string()))
+        .collect();
+    for &(k, lbl) in SYSTEM_PICKER_CODES {
+        out.push((k, lbl.to_string()));
+    }
+    for i in 0..16u16 {
+        out.push((0x7700 + i, format!("M{i}")));
+    }
+    for &(k, lbl) in LAYER_PICKER_CODES {
+        out.push((k, lbl.to_string()));
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_labels_and_keymap_roundtrip() {
+        assert_eq!(label(0x0004), "A");
+        assert_eq!(label(0x5221), "MO(1)");
+        assert_eq!(label(0x7703), "M3");
+        assert_eq!(label(0x005F), "KP7");
+        assert_eq!(label(0x1234), "0x1234");
+
+        let mut layers = vec![vec![vec![0u16; 14]; 5]; 4];
+        layers[0][2][1] = 0x0004;
+        layers[1][4][10] = 0x5221;
+        let bytes = encode_all_layers(&layers, 4, 5, 14);
+        assert_eq!(bytes.len(), 560);
+        let decoded = decode_all_layers(&bytes, 4, 5, 14);
+        assert_eq!(decoded, layers);
+        assert_eq!(keymap_diff_count(&bytes, &bytes), 0);
+
+        let mut bytes2 = bytes.clone();
+        bytes2[0] = 0x00;
+        bytes2[1] = 0x29;
+        assert_eq!(keymap_diff_count(&bytes, &bytes2), 1);
+    }
 }

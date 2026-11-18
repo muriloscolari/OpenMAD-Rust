@@ -90,8 +90,8 @@ impl OpenMadApp {
         let l = self.lang;
         let pt = l.is_pt();
         let cur_meta = LIGHT_EFFECTS.iter().find(|e| e.id == self.light_draft.effect);
-        let has_color = cur_meta.map_or(true, |e| e.has_color);
-        let has_speed = cur_meta.map_or(true, |e| e.has_speed);
+        let has_color = cur_meta.is_none_or(|e| e.has_color);
+        let has_speed = cur_meta.is_none_or(|e| e.has_speed);
 
         let effect_hint = if !has_color {
             l.t(
@@ -330,6 +330,17 @@ impl OpenMadApp {
             .on_press(Message::PaintSelectedKeys),
             button(
                 row![
+                    icon(Icon::Power, 13, TEXT_SECONDARY),
+                    text(l.t("Apagar Seleção", "Turn Off Selection")).size(type_scale::CAPTION + 1),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 11])
+            .style(secondary_button_style)
+            .on_press(Message::ClearKeyColorsSelection),
+            button(
+                row![
                     icon(Icon::HardDrive, 13, contrast_on(accent)),
                     text(l.t("Salvar na Flash", "Save to Flash"))
                         .size(type_scale::CAPTION + 1)
@@ -340,7 +351,7 @@ impl OpenMadApp {
             )
             .padding([6, 12])
             .style(primary_button_style(accent))
-            .on_press(Message::SaveLighting),
+            .on_press(Message::RequestCommitToFlash),
         ]
         .spacing(8);
 
@@ -423,19 +434,42 @@ impl OpenMadApp {
         ]
         .spacing(SP_SM);
 
-        let box_card = card(
-            l.t("Iluminação Lateral / Caixa", "Box / Side Lighting"),
-            Some(
-                l.t(
-                    "Controla os LEDs secundários/laterais em modelos com faixa externa.",
-                    "Controls secondary side/box LEDs on models equipped with side lighting.",
-                )
-                .to_string(),
-            ),
-            None,
-            box_body.into(),
-        );
+        let supports_box = self
+            .snap
+            .config
+            .as_ref()
+            .is_none_or(|c| c.capabilities.box_light);
 
-        column![main_card, box_card].spacing(SP_MD).into()
+        let mut cols = column![main_card].spacing(SP_MD);
+        if supports_box {
+            let box_card = card(
+                l.t("Iluminação Lateral / Caixa", "Box / Side Lighting"),
+                Some(
+                    l.t(
+                        "Controla os LEDs secundários/laterais em modelos com faixa externa.",
+                        "Controls secondary side/box LEDs on models equipped with side lighting.",
+                    )
+                    .to_string(),
+                ),
+                None,
+                box_body.into(),
+            );
+            cols = cols.push(box_card);
+        } else {
+            cols = cols.push(card(
+                l.t("Iluminação Lateral / Caixa", "Box / Side Lighting"),
+                Some(
+                    l.t(
+                        "Este modelo não reportou LEDs laterais/caixa na leitura de capacidades.",
+                        "This board did not report secondary box/side LEDs.",
+                    )
+                    .to_string(),
+                ),
+                None,
+                Space::with_height(Length::Fixed(0.0)).into(),
+            ));
+        }
+
+        cols.into()
     }
 }

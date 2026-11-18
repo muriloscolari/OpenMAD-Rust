@@ -10,6 +10,8 @@ pub struct AppSettings {
     pub check_updates: bool,
     #[serde(default)]
     pub start_at_login: bool,
+    #[serde(default = "default_true")]
+    pub close_to_tray: bool,
     #[serde(default = "default_gain")]
     pub led_gain: [f32; 3],
     #[serde(default = "default_language")]
@@ -33,6 +35,7 @@ impl Default for AppSettings {
         Self {
             check_updates: true,
             start_at_login: get_start_at_login(),
+            close_to_tray: true,
             led_gain: DEFAULT_LED_GAIN,
             language: default_language(),
         }

@@ -1,15 +1,25 @@
-//! Settings page with macOS-inspired grouped sections (General, Updates, LED Gain, About).
+//! Settings page with grouped sections (General, Updates, Live LED Gain Calibration).
 
 use crate::app::{Message, OpenMadApp};
 use crate::theme::{
-    contrast_on, pick_list_style, primary_button_style, secondary_button_style, type_scale,
-    FONT_MEDIUM, GREEN_OK, SP_MD, SP_SM, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
+    contrast_on, pick_list_style, primary_button_style, secondary_button_style, swatch_button_style,
+    type_scale, FONT_MEDIUM, GREEN_OK, SP_MD, SP_SM, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use crate::ui::components::{badge, card, slider_row, toggle_row};
 use crate::ui::icons::{icon, Icon};
-use iced::widget::{button, column, container, pick_list, row, text, Space};
+use iced::widget::{button, column, container, pick_list, row, text, Row, Space};
 use iced::{Alignment, Color, Element, Length};
 use openmad_core::updater::APP_VERSION;
+
+const CALIBRATION_TEST_COLORS: &[[u8; 3]] = &[
+    [255, 255, 255],
+    [255, 0, 0],
+    [0, 255, 0],
+    [0, 0, 255],
+    [255, 255, 0],
+    [0, 255, 255],
+    [255, 0, 255],
+];
 
 impl OpenMadApp {
     pub fn view_settings_page(&self, accent: Color) -> Element<'_, Message> {
@@ -34,8 +44,8 @@ impl OpenMadApp {
                             .font(FONT_MEDIUM)
                             .color(TEXT_PRIMARY),
                         text(l.t(
-                            "Altera imediatamente todos os textos do aplicativo.",
-                            "Immediately switches all UI labels.",
+                            "Altera imediatamente todos os textos do aplicativo e da bandeja.",
+                            "Immediately switches all UI and system tray labels.",
                         ))
                         .size(type_scale::CAPTION)
                         .color(TEXT_MUTED),
@@ -59,6 +69,19 @@ impl OpenMadApp {
                     self.settings.start_at_login,
                     accent,
                     Message::StartAtLoginToggled,
+                ),
+                toggle_row(
+                    l.t("Minimizar para a bandeja ao fechar (X)", "Close window to system tray"),
+                    Some(
+                        l.t(
+                            "Quando ativado, fechar a janela mantém o driver e a troca automática ativos em segundo plano.",
+                            "When enabled, closing the window keeps the driver and auto-switcher running in the tray.",
+                        )
+                        .to_string(),
+                    ),
+                    self.settings.close_to_tray,
+                    accent,
+                    Message::CloseToTrayToggled,
                 ),
             ]
             .spacing(SP_MD)
@@ -95,21 +118,27 @@ impl OpenMadApp {
         .spacing(8);
 
         if has_upd {
-            upd_actions = upd_actions.push(
-                button(
-                    row![
-                        icon(Icon::Download, 13, contrast_on(accent)),
-                        text(l.t("Instalar Atualização", "Install Update"))
-                            .size(type_scale::CAPTION + 1)
-                            .font(FONT_MEDIUM),
-                    ]
-                    .spacing(6)
-                    .align_y(Alignment::Center),
-                )
-                .padding([6, 12])
-                .style(primary_button_style(accent))
-                .on_press(Message::InstallUpdate),
-            );
+            let btn = button(
+                row![
+                    icon(Icon::Download, 13, contrast_on(accent)),
+                    text(if self.update_installing {
+                        l.t("Baixando…", "Downloading…")
+                    } else {
+                        l.t("Instalar Atualização", "Install Update")
+                    })
+                    .size(type_scale::CAPTION + 1)
+                    .font(FONT_MEDIUM),
+                ]
+                .spacing(6)
+                .align_y(Alignment::Center),
+            )
+            .padding([6, 12])
+            .style(primary_button_style(accent));
+            upd_actions = upd_actions.push(if self.update_installing {
+                btn
+            } else {
+                btn.on_press(Message::InstallUpdate)
+            });
         }
 
         let updates_card = card(
@@ -137,17 +166,41 @@ impl OpenMadApp {
             .into(),
         );
 
+        let mut test_swatches = Row::new().spacing(8).align_y(Alignment::Center);
+        test_swatches = test_swatches.push(
+            text(l.t("Cor de teste no teclado:", "Test color on keyboard:"))
+                .size(type_scale::CAPTION + 1)
+                .color(TEXT_SECONDARY),
+        );
+        for &[r, g, b] in CALIBRATION_TEST_COLORS {
+            test_swatches = test_swatches.push(
+                button(Space::with_width(Length::Fixed(20.0)).height(Length::Fixed(20.0)))
+                    .padding(0)
+                    .style(swatch_button_style(Color::from_rgb8(r, g, b), false))
+                    .on_press(Message::PreviewLedColor([r, g, b])),
+            );
+        }
+        if self.led_preview_restore.is_some() {
+            test_swatches = test_swatches.push(
+                button(text(l.t("Restaurar Iluminação", "Restore Lighting")).size(type_scale::CAPTION))
+                    .padding([5, 10])
+                    .style(secondary_button_style)
+                    .on_press(Message::RestoreLedPreview),
+            );
+        }
+
         let gain_card = card(
             l.t("Calibração de Cor dos LEDs (Ganho RGB)", "LED Channel Color Calibration (Gain)"),
             Some(
                 l.t(
-                    "Equilibra o balanço de branco dos LEDs em tempo real (verde e azul costumam ser mais fortes que o vermelho).",
-                    "Balances LED white point in real time (green/blue diodes are naturally brighter than red).",
+                    "Equilibra o balanço de branco dos LEDs em tempo real. Use uma cor de teste abaixo (ex.: Branco ou Amarelo) enquanto ajusta os canais.",
+                    "Balances LED white point in real time. Pick a test color below (e.g. White or Yellow) while tuning channel sliders.",
                 )
                 .to_string(),
             ),
             None,
             column![
+                test_swatches,
                 slider_row(
                     l.t("Ganho Vermelho", "Red Gain"),
                     0.1..=1.0,
@@ -200,7 +253,7 @@ impl OpenMadApp {
         container(
             column![general_card, updates_card, gain_card]
                 .spacing(SP_MD)
-                .max_width(760.0),
+                .max_width(780.0),
         )
         .width(Length::Fill)
         .center_x(Length::Fill)

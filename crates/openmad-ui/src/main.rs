@@ -11,6 +11,12 @@ mod widgets;
 use app::OpenMadApp;
 use iced::Size;
 use icon::generate_app_icon_rgba;
+use openmad_core::device::Mad68;
+use openmad_core::devices::UnlockedBoards;
+use openmad_core::paths::{profile_dir, settings_path, unlocked_boards_path};
+use openmad_core::profile::{list_profiles, profile_path, Profile};
+use openmad_core::protocol::FlashOp;
+use openmad_core::settings::AppSettings;
 use theme::{
     app_theme, FONT_INTER, INTER_MEDIUM_BYTES, INTER_REGULAR_BYTES, INTER_SEMIBOLD_BYTES,
     LUCIDE_FONT_BYTES,
@@ -52,15 +58,6 @@ fn install_linux_desktop_entry() {
                     updated = true;
                 }
             }
-            let repo_icon = std::path::Path::new("assets/icon.png");
-            if repo_icon.exists() {
-                let needs_repo = std::fs::read(repo_icon)
-                    .map(|cur| cur != png_bytes)
-                    .unwrap_or(false);
-                if needs_repo {
-                    let _ = std::fs::write(repo_icon, &png_bytes);
-                }
-            }
         }
     }
 
@@ -85,10 +82,11 @@ fn install_linux_desktop_entry() {
     let needs_write = std::fs::read_to_string(&desktop_path)
         .map(|cur| cur != desktop_content)
         .unwrap_or(true);
-    if needs_write && std::fs::create_dir_all(&apps_dir).is_ok() {
-        if std::fs::write(&desktop_path, desktop_content).is_ok() {
-            updated = true;
-        }
+    if needs_write
+        && std::fs::create_dir_all(&apps_dir).is_ok()
+        && std::fs::write(&desktop_path, desktop_content).is_ok()
+    {
+        updated = true;
     }
 
     if updated {
@@ -119,7 +117,78 @@ pub fn window_settings() -> iced::window::Settings {
     settings
 }
 
+fn try_cli_command() -> Option<i32> {
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--help" || a == "-h") {
+        println!(
+            "OpenMAD-Rust v{}\n\
+             Usage: openmad [OPTIONS]\n\n\
+             Options:\n  \
+               --minimized, --tray          Start minimized to system tray\n  \
+               --list-profiles              Print saved profile names and exit\n  \
+               --apply-profile <NAME>       Apply a profile to RAM and exit\n  \
+               --screenshot=<SCREEN>        Capture UI screenshot and exit",
+            env!("CARGO_PKG_VERSION")
+        );
+        return Some(0);
+    }
+    if args.iter().any(|a| a == "--list-profiles") {
+        for p in list_profiles(&profile_dir()) {
+            println!("{p}");
+        }
+        return Some(0);
+    }
+    let apply_name = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--apply-profile=").map(str::to_string))
+        .or_else(|| {
+            args.windows(2)
+                .find(|w| w[0] == "--apply-profile")
+                .map(|w| w[1].clone())
+        });
+    if let Some(name) = apply_name {
+        let path = match profile_path(&profile_dir(), &name) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                return Some(1);
+            }
+        };
+        let prof = match Profile::load(&path) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("{e}");
+                return Some(1);
+            }
+        };
+        let settings = AppSettings::load(&settings_path());
+        let unlocked = UnlockedBoards::load(&unlocked_boards_path());
+        let mut kb = match Mad68::open(true, false, settings.led_gain, &unlocked) {
+            Ok(kb) => kb,
+            Err(e) => {
+                eprintln!("Failed to open keyboard: {e}");
+                return Some(1);
+            }
+        };
+        match kb.apply_profile(&prof, FlashOp::Normal) {
+            Ok(writes) => {
+                println!("Applied profile '{name}' ({writes} packet group(s))");
+                return Some(0);
+            }
+            Err(e) => {
+                eprintln!("Failed to apply profile '{name}': {e}");
+                return Some(1);
+            }
+        }
+    }
+    None
+}
+
 fn main() -> iced::Result {
+    if let Some(code) = try_cli_command() {
+        std::process::exit(code);
+    }
+
     #[cfg(target_os = "linux")]
     install_linux_desktop_entry();
 

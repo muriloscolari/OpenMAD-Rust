@@ -2,12 +2,13 @@
 
 use crate::app::{Message, OpenMadApp, PerfSubTab};
 use crate::theme::{
-    contrast_on, primary_button_style, secondary_button_style, type_scale, FONT_MEDIUM,
+    contrast_on, primary_button_style, secondary_button_style, type_scale, AMBER_WARN, FONT_MEDIUM,
     FONT_SEMIBOLD, GREEN_OK, SP_MD, SP_SM, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
 use crate::ui::components::{badge, card, segmented, slider_row, toggle_row};
 use crate::ui::icons::{icon, Icon};
 use crate::widgets::gauge::TravelGaugeBar;
+use crate::widgets::travel_trace::TravelTraceCanvas;
 use iced::widget::{button, column, row, text, toggler, Space};
 use iced::{Alignment, Color, Element, Length};
 use openmad_core::keycodes;
@@ -168,6 +169,30 @@ impl OpenMadApp {
                         Space::with_width(Length::Fill),
                         text("3.50 mm").size(type_scale::CAPTION).color(TEXT_MUTED),
                     ],
+                    TravelTraceCanvas {
+                        samples: &self.snap.focus_trace,
+                        actuation_mm: self.actuation_mm,
+                        dead_top_mm: self.dead_top_mm,
+                        dead_bot_mm: self.dead_bot_mm,
+                        accent,
+                    }
+                    .view(),
+                    row![
+                        badge("≤0.80mm", Color::from_rgb(0.18, 0.68, 0.98)),
+                        badge("≤1.60mm", Color::from_rgb(0.24, 0.80, 0.48)),
+                        badge("≤2.30mm", Color::from_rgb(0.55, 0.58, 0.66)),
+                        badge(">2.30mm", AMBER_WARN),
+                        badge("● RT", Color::from_rgb(0.392, 0.824, 1.0)),
+                        Space::with_width(Length::Fill),
+                        text(l.t(
+                            "Osciloscópio ao vivo da tecla em foco",
+                            "Live focused-key oscilloscope",
+                        ))
+                        .size(type_scale::CAPTION)
+                        .color(TEXT_MUTED),
+                    ]
+                    .spacing(6)
+                    .align_y(Alignment::Center),
                 ]
                 .spacing(SP_SM);
 
@@ -302,16 +327,27 @@ impl OpenMadApp {
             PerfSubTab::Calibration => {
                 let calibrated = self.snap.populated.iter().filter(|&&p| p).count();
                 let total = self.snap.board.total_keys();
+                let focus_idx = self.selected_keys.iter().next().copied().unwrap_or(0);
+                let live_adc = self.snap.adc_raw.get(focus_idx).copied().unwrap_or(0);
+                let live_mm = self.snap.trip_mm.get(focus_idx).copied().unwrap_or(0.0);
+
                 card(
                     l.t("Calibração dos Switches", "Switch Calibration"),
                     Some(
                         l.t(
-                            "Clique em \"Iniciar Calibração\", pressione todas as teclas firmemente até o final e clique em \"Finalizar\".",
-                            "Click Start Calibration, press every key fully to bottom-out, then click Finish Calibration.",
+                            "Clique em \"Iniciar Calibração\", pressione todas as teclas firmemente até o final e clique em \"Finalizar\". O teclado acima mostra o valor ADC bruto de cada sensor.",
+                            "Click Start Calibration, press every key fully to bottom-out, then click Finish Calibration. The board above shows live raw ADC readings per switch.",
                         )
                         .to_string(),
                     ),
-                    Some(badge(format!("{calibrated} / {total}"), accent)),
+                    Some(
+                        row![
+                            badge(format!("ADC #{focus_idx}: {live_adc} ({live_mm:.2}mm)"), TEXT_SECONDARY),
+                            badge(format!("{calibrated} / {total}"), accent),
+                        ]
+                        .spacing(6)
+                        .into(),
+                    ),
                     row![
                         button(
                             row![
@@ -325,7 +361,7 @@ impl OpenMadApp {
                         )
                         .padding([8, 16])
                         .style(primary_button_style(accent))
-                        .on_press(Message::StartCalibration),
+                        .on_press(Message::RequestStartCalibration),
                         button(
                             row![
                                 icon(Icon::Check, 14, TEXT_PRIMARY),

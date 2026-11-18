@@ -13,7 +13,6 @@ use iced::widget::{
     Space,
 };
 use iced::{Alignment, Color, Element, Length};
-use openmad_core::profile::TriggerBinding;
 use openmad_core::switcher::watcher_backend_name;
 
 impl OpenMadApp {
@@ -37,21 +36,25 @@ impl OpenMadApp {
         .spacing(10)
         .align_y(Alignment::Center);
 
-        let status_body = row![
-            icon(Icon::AppWindow, 14, accent),
-            text(l.t("App em foco:", "Foreground App:"))
-                .size(type_scale::BODY)
+        let timing_row = row![
+            text(l.t("Debounce (ms):", "Debounce (ms):"))
+                .size(type_scale::CAPTION + 1)
                 .color(TEXT_SECONDARY),
-            text(
-                self.snap
-                    .foreground_exe
-                    .as_deref()
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or("—"),
-            )
-            .size(type_scale::BODY)
-            .font(FONT_SEMIBOLD)
-            .color(accent),
+            text_input("400", &self.switcher_cfg.debounce_ms.to_string())
+                .on_input(Message::SwitcherDebounceChanged)
+                .width(Length::Fixed(72.0))
+                .padding([5, 8])
+                .size(type_scale::CAPTION + 1)
+                .style(input_style(accent)),
+            text(l.t("Permanência mín. (ms):", "Min Dwell (ms):"))
+                .size(type_scale::CAPTION + 1)
+                .color(TEXT_SECONDARY),
+            text_input("800", &self.switcher_cfg.min_dwell_ms.to_string())
+                .on_input(Message::SwitcherDwellChanged)
+                .width(Length::Fixed(72.0))
+                .padding([5, 8])
+                .size(type_scale::CAPTION + 1)
+                .style(input_style(accent)),
             Space::with_width(Length::Fill),
             text(l.t("Perfil Padrão (Fallback):", "Default Fallback:"))
                 .size(type_scale::BODY)
@@ -62,6 +65,29 @@ impl OpenMadApp {
         ]
         .spacing(SP_SM)
         .align_y(Alignment::Center);
+
+        let status_body = column![
+            row![
+                icon(Icon::AppWindow, 14, accent),
+                text(l.t("App em foco:", "Foreground App:"))
+                    .size(type_scale::BODY)
+                    .color(TEXT_SECONDARY),
+                text(
+                    self.snap
+                        .foreground_exe
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("—"),
+                )
+                .size(type_scale::BODY)
+                .font(FONT_SEMIBOLD)
+                .color(accent),
+            ]
+            .spacing(SP_SM)
+            .align_y(Alignment::Center),
+            timing_row,
+        ]
+        .spacing(SP_SM);
 
         let status_card = card(
             l.t("Troca Automática por App", "Auto-Switcher"),
@@ -101,8 +127,12 @@ impl OpenMadApp {
                 )
                 .on_input(Message::TriggerExeChanged)
                 .style(input_style(accent)),
+                button(text(l.t("Procurar…", "Browse…")).size(type_scale::CAPTION + 1))
+                    .padding([8, 12])
+                    .style(secondary_button_style)
+                    .on_press(Message::BrowseTriggerExe),
                 text_input(
-                    l.t("Título da janela (opcional)", "Window Title (optional)"),
+                    l.t("Título da janela (opcional, aceita *)", "Window Title (optional, * glob)"),
                     &self.trigger_title,
                 )
                 .on_input(Message::TriggerTitleChanged)
@@ -169,14 +199,15 @@ impl OpenMadApp {
                 Icon::AppWindow,
                 l.t("Nenhuma regra configurada", "No rules configured yet"),
                 l.t(
-                    "Clique em uma janela aberta acima ou digite o nome do executável para vincular um perfil.",
-                    "Click a running window above or type an executable name to bind a profile.",
+                    "Clique em uma janela aberta acima, procure um executável ou digite o nome para vincular um perfil.",
+                    "Click a running window above, browse an executable, or type a name to bind a profile.",
                 ),
                 None,
                 None,
                 accent,
             )
         } else {
+            let total = self.switcher_cfg.rules.len();
             let mut rules_col = Column::new().spacing(6);
             for (i, r) in self.switcher_cfg.rules.iter().enumerate() {
                 let title_str = if r.title.is_empty() {
@@ -184,43 +215,59 @@ impl OpenMadApp {
                 } else {
                     r.title.clone()
                 };
+                let mut rule_row = row![
+                    icon(Icon::AppWindow, 14, accent),
+                    text(&r.exe)
+                        .size(type_scale::BODY)
+                        .font(FONT_SEMIBOLD)
+                        .color(TEXT_PRIMARY)
+                        .width(Length::Fixed(180.0)),
+                    text(title_str)
+                        .size(type_scale::CAPTION + 1)
+                        .color(TEXT_MUTED)
+                        .width(Length::Fill),
+                    badge(&r.profile, accent),
+                ]
+                .spacing(8)
+                .align_y(Alignment::Center);
+
+                if i > 0 {
+                    rule_row = rule_row.push(
+                        button(icon(Icon::ChevronUp, 13, TEXT_SECONDARY))
+                            .padding([4, 6])
+                            .style(ghost_button_style)
+                            .on_press(Message::MoveTriggerRuleUp(i)),
+                    );
+                }
+                if i + 1 < total {
+                    rule_row = rule_row.push(
+                        button(icon(Icon::ChevronDown, 13, TEXT_SECONDARY))
+                            .padding([4, 6])
+                            .style(ghost_button_style)
+                            .on_press(Message::MoveTriggerRuleDown(i)),
+                    );
+                }
+                rule_row = rule_row.push(
+                    button(icon(Icon::Trash, 13, RED_DANGER))
+                        .padding([4, 8])
+                        .style(ghost_button_style)
+                        .on_press(Message::RemoveTriggerRule(i)),
+                );
+
                 rules_col = rules_col.push(
-                    container(
-                        row![
-                            icon(Icon::AppWindow, 14, accent),
-                            text(&r.exe)
-                                .size(type_scale::BODY)
-                                .font(FONT_SEMIBOLD)
-                                .color(TEXT_PRIMARY)
-                                .width(Length::Fixed(180.0)),
-                            text(title_str)
-                                .size(type_scale::CAPTION + 1)
-                                .color(TEXT_MUTED)
-                                .width(Length::Fill),
-                            badge(&r.profile, accent),
-                            button(icon(Icon::Trash, 13, RED_DANGER))
-                                .padding([4, 8])
-                                .style(ghost_button_style)
-                                .on_press(Message::RemoveTriggerRule(i)),
-                        ]
-                        .spacing(10)
-                        .align_y(Alignment::Center)
-                        .padding([8, 12]),
-                    )
-                    .style(elevated_card_style),
+                    container(rule_row.padding([8, 12])).style(elevated_card_style),
                 );
             }
             rules_col.into()
         };
 
         let rules_card = card(
-            l.t("Regras Configuradas", "Configured Rules"),
+            l.t("Regras Configuradas (ordem de prioridade)", "Configured Rules (priority order)"),
             None,
             None,
             rules_body,
         );
 
-        let _ = TriggerBinding::default();
         column![status_card, add_card, rules_card]
             .spacing(SP_MD)
             .into()

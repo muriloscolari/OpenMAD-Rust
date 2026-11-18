@@ -80,6 +80,35 @@ pub fn in_bootloader() -> bool {
     found
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    pub light: bool,
+    pub box_light: bool,
+    pub dead_band: bool,
+    pub feature: bool,
+    pub dks: bool,
+    pub tap_dance: bool,
+    pub advanced_keys: bool,
+    pub macros: bool,
+    pub key_colors: bool,
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self {
+            light: true,
+            box_light: true,
+            dead_band: true,
+            feature: true,
+            dks: true,
+            tap_dance: true,
+            advanced_keys: true,
+            macros: true,
+            key_colors: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FullConfig {
     pub protocol_version: Option<u16>,
@@ -104,6 +133,12 @@ pub struct FullConfig {
     pub advanced_keys: Vec<AdvancedKey>,
     pub keymap: Vec<u8>,
     pub macros: Vec<Vec<MacroStep>>,
+    #[serde(default)]
+    pub macro_count: usize,
+    #[serde(default)]
+    pub macro_buffer_size: usize,
+    #[serde(default)]
+    pub capabilities: Capabilities,
 }
 
 pub struct Mad68 {
@@ -640,6 +675,10 @@ impl Mad68 {
         mask
     }
 
+    pub fn clear_populated_cache(&mut self) {
+        self.populated_cache = None;
+    }
+
     pub fn start_calibration(&self) -> Result<()> {
         self.vendor_set(Vendor::CalibrationStart, &[])?;
         Ok(())
@@ -653,6 +692,34 @@ impl Mad68 {
     pub fn factory_reset(&self) -> Result<()> {
         self.vendor_set(Vendor::ResetAll, &[])?;
         Ok(())
+    }
+
+    pub fn reset_keymap(&self) -> Result<()> {
+        self.cmd(Cmd::DynamicKeymapReset, &[])?;
+        Ok(())
+    }
+
+    pub fn iter_probe_reads(&self) -> Vec<(String, std::result::Result<Vec<u8>, String>)> {
+        let safe = [
+            ("DEAD_BAND", Vendor::DeadBand),
+            ("FEATURE", Vendor::Feature),
+            ("GAME_MODE", Vendor::GameMode),
+            ("BOTTOM_OPTIMIZE_SWITCH", Vendor::BottomOptimizeSwitch),
+            ("LIGHT_INFO", Vendor::LightInfo),
+            ("LAYER", Vendor::Layer),
+            ("RS", Vendor::Rs),
+            ("BOX_LIGHT", Vendor::BoxLight),
+            ("MIX_AXLE", Vendor::MixAxle),
+        ];
+        safe.into_iter()
+            .map(|(name, sub)| {
+                let res = self
+                    .vendor_get(sub, &[])
+                    .map(|r| r.payload().to_vec())
+                    .map_err(|e| e.to_string());
+                (name.to_string(), res)
+            })
+            .collect()
     }
 
     pub fn read_dks(&self, index: usize) -> Result<Dks> {
@@ -1007,34 +1074,55 @@ impl Mad68 {
         let populated = self.populated_mask();
         let actuation = self.read_actuation_bulk()?;
         let rapid_trigger = self.read_rapid_trigger_bulk()?;
-        let dead_band = self.read_dead_band().unwrap_or_default();
-        let feature = self.read_feature().unwrap_or_default();
+
+        let db_res = self.read_dead_band();
+        let feat_res = self.read_feature();
         let game_mode = self.read_game_mode().unwrap_or(0);
         let bottom_optimize = self.read_bottom_optimize().unwrap_or(0);
-        let light = self.read_light_info().unwrap_or_default();
-        let box_light = self.read_box_light().unwrap_or_default();
-        let key_colors = self.read_all_key_colors().unwrap_or_default();
+        let light_res = self.read_light_info();
+        let box_res = self.read_box_light();
+        let colors_res = self.read_all_key_colors();
 
         let mut dks = Vec::with_capacity(16);
+        let mut dks_ok = false;
         for i in 0..16 {
             if let Ok(d) = self.read_dks(i) {
+                dks_ok = true;
                 dks.push(d);
             }
         }
         let mut tap_dance = Vec::with_capacity(16);
+        let mut td_ok = false;
         for i in 0..16 {
             if let Ok(td) = self.read_tap_dance(i) {
+                td_ok = true;
                 tap_dance.push(td);
             }
         }
         let mut advanced_keys = Vec::with_capacity(16);
+        let mut ak_ok = false;
         for i in 0..16 {
             if let Ok(ak) = self.read_advanced_key(i) {
+                ak_ok = true;
                 advanced_keys.push(ak);
             }
         }
         let keymap = self.read_keymap().unwrap_or_default();
-        let macros = self.read_macro_steps().unwrap_or_default();
+        let macro_count = self.macro_count().unwrap_or(16);
+        let macro_buffer_size = self.macro_buffer_size().unwrap_or(0);
+        let macros_res = self.read_macro_steps();
+
+        let capabilities = Capabilities {
+            light: light_res.is_ok(),
+            box_light: box_res.is_ok(),
+            dead_band: db_res.is_ok(),
+            feature: feat_res.is_ok(),
+            dks: dks_ok,
+            tap_dance: td_ok,
+            advanced_keys: ak_ok,
+            macros: macros_res.is_ok(),
+            key_colors: colors_res.as_ref().is_ok_and(|c| !c.is_empty()),
+        };
 
         Ok(FullConfig {
             protocol_version: self.protocol_version,
@@ -1047,18 +1135,21 @@ impl Mad68 {
             populated,
             actuation,
             rapid_trigger,
-            dead_band,
-            feature,
+            dead_band: db_res.unwrap_or_default(),
+            feature: feat_res.unwrap_or_default(),
             game_mode,
             bottom_optimize,
-            light,
-            box_light,
-            key_colors,
+            light: light_res.unwrap_or_default(),
+            box_light: box_res.unwrap_or_default(),
+            key_colors: colors_res.unwrap_or_default(),
             dks,
             tap_dance,
             advanced_keys,
             keymap,
-            macros,
+            macros: macros_res.unwrap_or_default(),
+            macro_count,
+            macro_buffer_size,
+            capabilities,
         })
     }
 
@@ -1068,16 +1159,45 @@ impl Mad68 {
         let mut writes = 0usize;
         let rows = self.spec.rows;
         let cols = self.spec.cols;
+        let layers = self.spec.layers;
         let total = self.total_keys();
 
-        // 1. Actuation
+        // 1. Advanced keys / DKS / TapDance first (only write slots that actually differ).
+        // Writing RS/SOCD resets bound keys' actuation in firmware, so this MUST happen
+        // before the actuation write below.
+        if let Some(ref dks_list) = profile.dks {
+            for d in dks_list {
+                if self.read_dks(d.index).ok().as_ref() != Some(d) {
+                    self.write_dks(d)?;
+                    writes += 1;
+                }
+            }
+        }
+        if let Some(ref td_list) = profile.tap_dance {
+            for td in td_list {
+                if self.read_tap_dance(td.index).ok().as_ref() != Some(td) {
+                    self.write_tap_dance(td)?;
+                    writes += 1;
+                }
+            }
+        }
+        if let Some(ref ak_list) = profile.advanced_keys {
+            for ak in ak_list {
+                if self.read_advanced_key(ak.index).ok().as_ref() != Some(ak) {
+                    self.write_advanced_key(ak)?;
+                    writes += 1;
+                }
+            }
+        }
+
+        // 2. Actuation
         let current_act = self.read_actuation_bulk()?;
         let mut desired_act = Vec::with_capacity(total);
         let mut act_changed = false;
-        for idx in 0..total {
+        for (idx, &cur_val) in current_act.iter().enumerate().take(total) {
             let (r, c) = self.key_rowcol(idx);
             let want = profile.actuation_for(r, c);
-            if (current_act[idx] - want).abs() > 0.005 {
+            if (cur_val - want).abs() > 0.005 {
                 act_changed = true;
             }
             desired_act.push(want);
@@ -1087,14 +1207,13 @@ impl Mad68 {
             writes += 1;
         }
 
-        // 2. Rapid Trigger
+        // 3. Rapid Trigger
         let current_rt = self.read_rapid_trigger_bulk()?;
         let mut desired_rt = Vec::with_capacity(total);
         let mut rt_changed = false;
-        for idx in 0..total {
+        for (idx, cur) in current_rt.iter().enumerate().take(total) {
             let (r, c) = self.key_rowcol(idx);
             let spec = profile.rapid_trigger_for(r, c);
-            let cur = &current_rt[idx];
             if cur.enabled != spec.enabled
                 || (cur.press_mm - spec.press_mm).abs() > 0.005
                 || (cur.release_mm - spec.release_mm).abs() > 0.005
@@ -1114,25 +1233,40 @@ impl Mad68 {
             writes += 1;
         }
 
-        // 3. Scalar settings
+        // 4. Scalar settings (diff against current hardware state)
         if let Some(ref db) = profile.dead_band {
-            self.write_dead_band(db)?;
-            writes += 1;
+            let differs = match self.read_dead_band() {
+                Ok(cur) => {
+                    (cur.top_mm - db.top_mm).abs() > 0.005
+                        || (cur.bottom_mm - db.bottom_mm).abs() > 0.005
+                }
+                Err(_) => true,
+            };
+            if differs {
+                self.write_dead_band(db)?;
+                writes += 1;
+            }
         }
         if let Some(ref feat) = profile.feature {
-            self.write_feature(feat)?;
-            writes += 1;
+            if self.read_feature().ok().as_ref() != Some(feat) {
+                self.write_feature(feat)?;
+                writes += 1;
+            }
         }
         if let Some(gm) = profile.game_mode {
-            self.write_game_mode(gm)?;
-            writes += 1;
+            if self.read_game_mode().ok() != Some(gm) {
+                self.write_game_mode(gm)?;
+                writes += 1;
+            }
         }
         if let Some(bo) = profile.bottom_optimize {
-            self.write_bottom_optimize(bo)?;
-            writes += 1;
+            if self.read_bottom_optimize().ok() != Some(bo) {
+                self.write_bottom_optimize(bo)?;
+                writes += 1;
+            }
         }
 
-        // 4. Lighting
+        // 5. Lighting
         if let Some(mut light) = profile.light {
             if ANIMATED_EFFECTS.contains(&light.effect) && light.speed == 0 {
                 light.speed = DEFAULT_EFFECT_SPEED;
@@ -1143,8 +1277,23 @@ impl Mad68 {
                 light.g = DEFAULT_EFFECT_COLOUR.1;
                 light.b = DEFAULT_EFFECT_COLOUR.2;
             }
-            self.write_light_info(&light)?;
-            writes += 1;
+            let light_differs = match self.read_light_info() {
+                Ok(cur) => {
+                    cur.effect != light.effect
+                        || cur.speed != light.speed
+                        || cur.brightness != light.brightness
+                        || (!ANIMATED_EFFECTS.contains(&light.effect)
+                            && COLOUR_EFFECTS.contains(&light.effect)
+                            && ((cur.r as i16 - light.r as i16).abs() > COLOR_TOLERANCE
+                                || (cur.g as i16 - light.g as i16).abs() > COLOR_TOLERANCE
+                                || (cur.b as i16 - light.b as i16).abs() > COLOR_TOLERANCE))
+                }
+                Err(_) => true,
+            };
+            if light_differs {
+                self.write_light_info(&light)?;
+                writes += 1;
+            }
 
             if light.effect == PER_KEY_EFFECT {
                 if let Some(ref raw_colors) = profile.key_colors {
@@ -1153,7 +1302,7 @@ impl Mad68 {
                     let mask = self.populated_mask();
                     let diff = fitted.iter().enumerate().any(|(i, c)| {
                         mask.get(i).copied().unwrap_or(true)
-                            && cur_colors.get(i).map_or(true, |cur| {
+                            && cur_colors.get(i).is_none_or(|cur| {
                                 (cur[0] as i16 - c[0] as i16).abs() > COLOR_TOLERANCE
                                     || (cur[1] as i16 - c[1] as i16).abs() > COLOR_TOLERANCE
                                     || (cur[2] as i16 - c[2] as i16).abs() > COLOR_TOLERANCE
@@ -1167,33 +1316,20 @@ impl Mad68 {
             }
         }
         if let Some(ref box_l) = profile.box_light {
-            self.write_box_light(box_l)?;
-            writes += 1;
+            if self.read_box_light().ok().as_ref() != Some(box_l) {
+                self.write_box_light(box_l)?;
+                writes += 1;
+            }
         }
 
-        // 5. Advanced keys / DKS / TapDance
-        if let Some(ref dks_list) = profile.dks {
-            for d in dks_list {
-                self.write_dks(d)?;
-                writes += 1;
-            }
-        }
-        if let Some(ref td_list) = profile.tap_dance {
-            for td in td_list {
-                self.write_tap_dance(td)?;
-                writes += 1;
-            }
-        }
-        if let Some(ref ak_list) = profile.advanced_keys {
-            for ak in ak_list {
-                self.write_advanced_key(ak)?;
-                writes += 1;
-            }
-            // Re-apply actuation to bound keys since firmware resets them on RS/SOCD write.
-            let _ = self.write_actuation_bulk(&desired_act, 0, flash_op);
-        }
-
+        // 6. Keymap (EEPROM write — only on explicit onboard flash commit)
         if flash_op == FlashOp::EraseAndWrite {
+            if let Some(want_km) = profile.to_keymap_bytes(layers, rows, cols) {
+                if self.read_keymap().ok().as_deref() != Some(want_km.as_slice()) {
+                    self.write_keymap(&want_km)?;
+                    writes += 1;
+                }
+            }
             let _ = self.save_lighting();
         }
 

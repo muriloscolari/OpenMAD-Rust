@@ -25,19 +25,6 @@ pub struct BoardSpec {
 }
 
 impl BoardSpec {
-    pub const fn new_static(
-        product_id: u16,
-        name: &'static str,
-        rows: usize,
-        cols: usize,
-        layers: usize,
-        bootloader_id: u16,
-        verified: bool,
-    ) -> Self {
-        let _ = (product_id, name, rows, cols, layers, bootloader_id, verified);
-        unreachable!()
-    }
-
     pub fn total_keys(&self) -> usize {
         self.rows * self.cols
     }
@@ -199,5 +186,44 @@ fn parse_pid(s: &str) -> Option<u16> {
         u16::from_str_radix(hex, 16).ok()
     } else {
         t.parse::<u16>().ok()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_board_lookup_and_bootloader() {
+        let mad60 = lookup(0x1054).unwrap();
+        assert_eq!(mad60.name, "MAD60 HE RGB");
+        assert_eq!(mad60.form_factor(), FormFactor::Layout60);
+        assert!(mad60.verified);
+
+        let mad68 = lookup(0x1058).unwrap();
+        assert_eq!(mad68.form_factor(), FormFactor::Layout65);
+        assert_eq!(mad68.total_keys(), 75);
+
+        let macropad = lookup(0x107D).unwrap();
+        assert_eq!(macropad.form_factor(), FormFactor::Macropad);
+        assert!(!macropad.verified);
+
+        assert!(is_bootloader_pid(0x2020));
+        assert!(!is_bootloader_pid(0x1054));
+
+        let unknown = describe(0x9999);
+        assert!(!unknown.verified);
+        assert_eq!(unknown.product_id, 0x9999);
+    }
+
+    #[test]
+    fn test_unlocked_boards_memory() {
+        let mut ub = UnlockedBoards::default();
+        assert!(!ub.is_unlocked(0x1059));
+        ub.set_unlocked(0x1059, true);
+        assert!(ub.is_unlocked(0x1059));
+        assert_eq!(ub.list(), vec![0x1059]);
+        ub.set_unlocked(0x1059, false);
+        assert!(!ub.is_unlocked(0x1059));
     }
 }

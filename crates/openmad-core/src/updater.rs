@@ -178,3 +178,16 @@ pub fn download_and_apply_update(info: &UpdateInfo) -> Result<String, String> {
 pub fn download_and_apply_update(_info: &UpdateInfo) -> Result<String, String> {
     Err("Self-update is only supported on Linux and Windows".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_version_tuple_comparison() {
+        assert_eq!(version_tuple("v0.1.1"), vec![0, 1, 1]);
+        assert_eq!(version_tuple("0.2.0-rc1"), vec![0, 2, 0]);
+        assert!(version_tuple("v0.2.0") > version_tuple("0.1.1"));
+        assert!(version_tuple("v1.0.0") > version_tuple("v0.9.9"));
+    }
+}

@@ -401,3 +401,46 @@ pub fn join_macro_buffer(macros: &[Vec<u8>], size: usize) -> Result<Vec<u8>, Str
     out.resize(size, 0);
     Ok(out)
 }
+
+pub fn encoded_macro_len(steps: &[MacroStep]) -> usize {
+    encode_macro(steps).map_or(0, |v| v.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dks_roundtrip() {
+        let mut dks = Dks::empty(3);
+        dks.actions[0] = DksAction::from_keycode(0x0004, 0b00_0000_0101);
+        dks.actions[1] = DksAction::from_keycode(0x00E1, 0b10_0000_0010);
+        let raw = dks.to_bytes();
+        assert_eq!(raw.len(), DKS_ACTION_COUNT * DKS_ACTION_SIZE);
+        let parsed = Dks::from_bytes(3, &raw);
+        assert_eq!(parsed, dks);
+        assert!(!parsed.is_empty());
+        assert!(parsed.actions[0].bits()[0]);
+        assert!(parsed.actions[0].bits()[2]);
+    }
+
+    #[test]
+    fn test_macro_encode_decode_and_split() {
+        let steps = vec![
+            MacroStep::Text { text: "hi".into() },
+            MacroStep::Tap { keycode: 0x0028 },
+            MacroStep::Delay { delay_ms: 350 },
+            MacroStep::Down { keycode: 0x5221 },
+            MacroStep::Up { keycode: 0x5221 },
+        ];
+        let encoded = encode_macro(&steps).unwrap();
+        let decoded = decode_macro(&encoded);
+        assert_eq!(decoded, steps);
+
+        let buf = join_macro_buffer(&[encoded.clone(), vec![]], 64).unwrap();
+        assert_eq!(buf.len(), 64);
+        let split = split_macro_buffer(&buf, 2);
+        assert_eq!(split[0], encoded);
+        assert!(split[1].is_empty());
+    }
+}

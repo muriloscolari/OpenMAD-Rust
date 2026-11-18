@@ -1,0 +1,21 @@
+[package]
+name = "openmad-ui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "openmad"
+path = "src/main.rs"
+
+[dependencies]
+openmad-core = { path = "../openmad-core" }
+iced = { version = "0.13", features = ["canvas", "tokio", "image", "advanced"] }
+rfd = "0.15"
+tray-icon = { version = "0.19", default-features = false }
+image = "0.25"
+open = "5"
+serde_json = "1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+gtk = "0.18"

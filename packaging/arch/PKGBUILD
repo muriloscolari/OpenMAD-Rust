@@ -1,0 +1,26 @@
+# Maintainer: Murilo Scolari <https://github.com/muriloscolari/OpenMAD-Rust>
+pkgname=openmad-rust
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="100% Native Rust driver and GUI for MAD68 HE / MAD60 HE Hall-effect keyboards"
+arch=('x86_64')
+url="https://github.com/muriloscolari/OpenMAD-Rust"
+license=('GPL-3.0-or-later')
+depends=('hidapi' 'gtk3' 'libayatana-appindicator' 'dbus')
+makedepends=('rust' 'cargo')
+source=("$pkgname-$pkgver.tar.gz::https://github.com/muriloscolari/OpenMAD-Rust/archive/refs/tags/v$pkgver.tar.gz")
+sha256sums=('SKIP')
+
+build() {
+  cd "$srcdir/OpenMAD-Rust-$pkgver"
+  cargo build --release --locked --bin openmad
+}
+
+package() {
+  cd "$srcdir/OpenMAD-Rust-$pkgver"
+  install -Dm755 "target/release/openmad" "$pkgdir/usr/bin/openmad"
+  install -Dm644 "packaging/linux/60-openmad.rules" "$pkgdir/usr/lib/udev/rules.d/60-openmad.rules"
+  install -Dm644 "packaging/linux/openmad.desktop" "$pkgdir/usr/share/applications/openmad.desktop"
+  install -Dm644 "assets/icon.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/openmad-rust.png"
+  install -Dm644 "LICENSE" "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

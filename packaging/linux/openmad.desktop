@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OpenMAD
+Comment=Native Rust driver for MAD68 HE / MAD60 HE magnetic-switch keyboards
+Exec=/usr/bin/openmad
+Icon=openmad-rust
+Terminal=false
+Categories=Utility;HardwareSettings;
+StartupWMClass=openmad

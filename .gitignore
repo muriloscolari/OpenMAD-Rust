@@ -11,6 +11,7 @@ venv/
 env/
 
 # Build output
+target/
 build/
 dist/
 *.spec.bak

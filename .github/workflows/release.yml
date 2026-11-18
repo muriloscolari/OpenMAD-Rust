@@ -75,7 +75,6 @@ jobs:
   publish:
     name: Publish GitHub Release
     needs: [linux, windows]
-    if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -86,5 +85,7 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release upload "${{ github.ref_name }}" artifacts/* --clobber || \
-          gh release create "${{ github.ref_name }}" artifacts/* --title "OpenMAD-Rust ${{ github.ref_name }}" --generate-notes
+          TAG="${{ github.ref_name }}"
+          if [[ "$TAG" != v* ]]; then TAG="v0.1.0"; fi
+          gh release upload "$TAG" artifacts/* --clobber || \
+          gh release create "$TAG" artifacts/* --title "OpenMAD-Rust $TAG" --generate-notes

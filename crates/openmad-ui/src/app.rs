@@ -247,6 +247,9 @@ pub enum Message {
     SetGainPreset([f32; 3]),
     StartAtLoginToggled(bool),
     CheckUpdatesPrefToggled(bool),
+
+    // Headless screenshot utility mode
+    ScreenshotCaptured(String, window::Screenshot),
 }
 
 pub struct OpenMadApp {
@@ -311,6 +314,8 @@ pub struct OpenMadApp {
     pending_update: Arc<Mutex<Option<Result<UpdateInfo, String>>>>,
     toast: Option<(String, bool, u8)>,
     synced_initial: bool,
+    screenshot_target: Option<String>,
+    screenshot_ticks: u32,
 }
 
 impl OpenMadApp {
@@ -326,7 +331,9 @@ impl OpenMadApp {
         let processes = list_windowed_processes();
 
         let start_minimized = std::env::args().any(|a| a == "--minimized" || a == "--tray");
-        let (window_id, init_task) = if start_minimized {
+        let screenshot_target = std::env::args()
+            .find_map(|a| a.strip_prefix("--screenshot=").map(|s| s.to_string()));
+        let (window_id, init_task) = if start_minimized && screenshot_target.is_none() {
             (None, Task::none())
         } else {
             let (win_id, open_task) = window::open(crate::window_settings());
@@ -405,6 +412,8 @@ impl OpenMadApp {
             pending_update,
             toast: None,
             synced_initial: false,
+            screenshot_target,
+            screenshot_ticks: 0,
         };
         (app, init_task)
     }
@@ -653,6 +662,62 @@ impl OpenMadApp {
                         }
                     }
                 }
+                if let Some(target) = self.screenshot_target.clone() {
+                    self.screenshot_ticks += 1;
+                    self.toast = None;
+                    self.lang = Lang::Pt;
+                    match target.as_str() {
+                        "lighting" => {
+                            self.show_settings = false;
+                            self.view = SidebarView::Equipment;
+                            self.equip_tab = EquipTab::Lighting;
+                        }
+                        "performance" => {
+                            self.show_settings = false;
+                            self.view = SidebarView::Equipment;
+                            self.equip_tab = EquipTab::Performance;
+                            self.perf_sub = PerfSubTab::Travel;
+                        }
+                        "app-trigger" => {
+                            self.show_settings = false;
+                            self.view = SidebarView::Equipment;
+                            self.equip_tab = EquipTab::AppTrigger;
+                        }
+                        "remap" => {
+                            self.show_settings = false;
+                            self.view = SidebarView::Equipment;
+                            self.equip_tab = EquipTab::ChangeKey;
+                        }
+                        "settings" => {
+                            self.show_settings = true;
+                        }
+                        _ => {}
+                    }
+                    if self.screenshot_ticks == 36 {
+                        if let Some(id) = self.window_id {
+                            let out = format!("assets/screenshots/{target}.png");
+                            return window::screenshot(id)
+                                .map(move |s| Message::ScreenshotCaptured(out.clone(), s));
+                        }
+                    } else if self.screenshot_ticks > 60 {
+                        self.sampler.stop();
+                        return iced::exit();
+                    }
+                }
+            }
+            Message::ScreenshotCaptured(path, shot) => {
+                if let Some(img) = image::RgbaImage::from_raw(
+                    shot.size.width,
+                    shot.size.height,
+                    shot.bytes.to_vec(),
+                ) {
+                    if let Some(parent) = std::path::Path::new(&path).parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    let _ = img.save(&path);
+                }
+                self.sampler.stop();
+                return iced::exit();
             }
             Message::WindowCloseRequested(id) => {
                 if self.window_id == Some(id) {

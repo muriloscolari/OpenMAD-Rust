@@ -26,14 +26,20 @@
 
 ## Screenshots
 
-### Real-Time RGB Lighting & 2D Color Picker
+### Real-Time RGB Lighting & 2D HSV Color Picker
 ![Real-Time RGB Lighting](assets/screenshots/lighting.png)
 
 ### Performance, Key Travel Telemetry (0.10–3.50 mm) & Rapid Trigger
-![Performance and Telemetry](assets/screenshots/performance.jpg)
+![Performance and Telemetry](assets/screenshots/performance.png)
+
+### Key Remapping & Layers
+![Key Remapping](assets/screenshots/remap.png)
 
 ### Per-App Profile Auto-Switching (KDE Wayland / Windows)
-![App Trigger](assets/screenshots/app-trigger.jpg)
+![App Trigger](assets/screenshots/app-trigger.png)
+
+### Settings, RGB Gain Calibration, Autostart & Auto-Updater
+![Settings](assets/screenshots/settings.png)
 
 ---
 

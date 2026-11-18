@@ -26,14 +26,20 @@ O **OpenMAD-Rust** substitui completamente o configurador web oficial da Madlion
 
 ## Capturas de Tela
 
-### Iluminação RGB em Tempo Real & Seletor 2D (PT-BR)
+### Iluminação RGB em Tempo Real & Seletor 2D HSV
 ![Iluminação RGB em Tempo Real](assets/screenshots/lighting.png)
 
 ### Performance, Curso das Teclas (0.10–3.50 mm) & Rapid Trigger
-![Performance e Telemetria](assets/screenshots/performance.jpg)
+![Performance e Telemetria](assets/screenshots/performance.png)
+
+### Remapeamento de Teclas & Camadas
+![Remapeamento de Teclas](assets/screenshots/remap.png)
 
 ### Troca Automática de Perfil por Aplicativo (KDE Wayland / Windows)
-![App Trigger](assets/screenshots/app-trigger.jpg)
+![App Trigger](assets/screenshots/app-trigger.png)
+
+### Configurações, Calibração RGB, Autostart & Auto-Updater
+![Configurações](assets/screenshots/settings.png)
 
 ---
 

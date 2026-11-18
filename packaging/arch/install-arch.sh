@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PKGVER="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$ROOT_DIR/Cargo.toml" | head -n1)"
-PKGVER="${PKGVER:-0.2.0}"
+PKGVER="${PKGVER:-0.2.1}"
 
 echo "==> Building OpenMAD-Rust release binary..."
 cd "$ROOT_DIR"

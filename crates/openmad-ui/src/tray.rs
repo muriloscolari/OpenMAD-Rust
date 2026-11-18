@@ -1,10 +1,12 @@
 //! Cross-platform system tray icon and dynamic bilingual quick menu.
 
 use crate::icon::generate_app_icon_rgba;
+use std::collections::VecDeque;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 #[cfg(target_os = "linux")]
+use std::thread::JoinHandle;
 use std::time::Duration;
 use tray_icon::menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 #[cfg(not(target_os = "linux"))]
@@ -39,6 +41,49 @@ pub struct TrayMenuState {
     pub is_pt: bool,
 }
 
+#[derive(Debug, Clone)]
+enum RawTrayEvent {
+    Menu(MenuId),
+    Click,
+}
+
+struct TrayQueue {
+    events: Mutex<VecDeque<RawTrayEvent>>,
+    wake: Condvar,
+}
+
+static TRAY_QUEUE: OnceLock<TrayQueue> = OnceLock::new();
+
+fn tray_queue() -> &'static TrayQueue {
+    TRAY_QUEUE.get_or_init(|| {
+        MenuEvent::set_event_handler(Some(|ev: MenuEvent| {
+            if let Some(q) = TRAY_QUEUE.get() {
+                if let Ok(mut g) = q.events.lock() {
+                    g.push_back(RawTrayEvent::Menu(ev.id));
+                    q.wake.notify_all();
+                }
+            }
+        }));
+        TrayIconEvent::set_event_handler(Some(|ev: TrayIconEvent| {
+            if matches!(
+                ev,
+                TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. }
+            ) {
+                if let Some(q) = TRAY_QUEUE.get() {
+                    if let Ok(mut g) = q.events.lock() {
+                        g.push_back(RawTrayEvent::Click);
+                        q.wake.notify_all();
+                    }
+                }
+            }
+        }));
+        TrayQueue {
+            events: Mutex::new(VecDeque::new()),
+            wake: Condvar::new(),
+        }
+    })
+}
+
 pub struct TrayHandle {
     #[cfg(not(target_os = "linux"))]
     tray: TrayIcon,
@@ -46,13 +91,19 @@ pub struct TrayHandle {
     stop: Arc<AtomicBool>,
     #[cfg(target_os = "linux")]
     update_tx: mpsc::Sender<TrayMenuState>,
+    #[cfg(target_os = "linux")]
+    thread_handle: Option<JoinHandle<()>>,
     ids: Arc<Mutex<TrayMenuIds>>,
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for TrayHandle {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::Relaxed);
+        self.stop.store(true, Ordering::Release);
+        gtk::glib::MainContext::default().invoke(|| {});
+        if let Some(h) = self.thread_handle.take() {
+            let _ = h.join();
+        }
     }
 }
 
@@ -143,6 +194,10 @@ fn build_menu(st: &TrayMenuState) -> (Menu, TrayMenuIds) {
 impl TrayHandle {
     #[cfg(not(target_os = "linux"))]
     pub fn new(initial: TrayMenuState) -> Option<Self> {
+        let q = tray_queue();
+        if let Ok(mut g) = q.events.lock() {
+            g.clear();
+        }
         let icon = load_tray_icon()?;
         let (menu, menu_ids) = build_menu(&initial);
         let ids = Arc::new(Mutex::new(menu_ids));
@@ -159,6 +214,10 @@ impl TrayHandle {
 
     #[cfg(target_os = "linux")]
     pub fn new(initial: TrayMenuState) -> Option<Self> {
+        let q = tray_queue();
+        if let Ok(mut g) = q.events.lock() {
+            g.clear();
+        }
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = Arc::clone(&stop);
         let ids = Arc::new(Mutex::new(TrayMenuIds::default()));
@@ -166,7 +225,7 @@ impl TrayHandle {
         let (ready_tx, ready_rx) = mpsc::channel::<bool>();
         let (update_tx, update_rx) = mpsc::channel::<TrayMenuState>();
 
-        std::thread::spawn(move || {
+        let thread_handle = std::thread::spawn(move || {
             if gtk::init().is_err() {
                 let _ = ready_tx.send(false);
                 return;
@@ -194,7 +253,9 @@ impl TrayHandle {
 
             let _ = ready_tx.send(true);
 
-            while !stop_thread.load(Ordering::Relaxed) {
+            // Pure event-driven GTK iteration: blocks in kernel poll() at ~0% CPU until
+            // AppIndicator D-Bus events, menu updates, or Drop invoke() arrive.
+            while !stop_thread.load(Ordering::Acquire) {
                 while let Ok(next_state) = update_rx.try_recv() {
                     let (new_menu, new_ids) = build_menu(&next_state);
                     if let Ok(mut guard) = ids_thread.lock() {
@@ -205,17 +266,22 @@ impl TrayHandle {
                 while gtk::events_pending() {
                     gtk::main_iteration_do(false);
                 }
-                std::thread::sleep(Duration::from_millis(50));
+                if stop_thread.load(Ordering::Acquire) {
+                    break;
+                }
+                gtk::main_iteration_do(true);
             }
         });
 
         if !ready_rx.recv().ok()? {
+            let _ = thread_handle.join();
             return None;
         }
 
         Some(Self {
             stop,
             update_tx,
+            thread_handle: Some(thread_handle),
             ids,
         })
     }
@@ -224,6 +290,7 @@ impl TrayHandle {
         #[cfg(target_os = "linux")]
         {
             let _ = self.update_tx.send(state);
+            gtk::glib::MainContext::default().invoke(|| {});
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -235,39 +302,52 @@ impl TrayHandle {
         }
     }
 
-    pub fn poll_event(&self) -> Option<TrayAction> {
-        if let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if let Ok(guard) = self.ids.lock() {
-                if guard.show_id.as_ref() == Some(&ev.id) {
-                    return Some(TrayAction::ShowWindow);
-                }
-                if guard.hide_id.as_ref() == Some(&ev.id) {
-                    return Some(TrayAction::HideWindow);
-                }
-                if guard.toggle_id.as_ref() == Some(&ev.id) {
-                    return Some(TrayAction::ToggleSwitcher);
-                }
-                if guard.flash_id.as_ref() == Some(&ev.id) {
-                    return Some(TrayAction::CommitToFlash);
-                }
-                if guard.quit_id.as_ref() == Some(&ev.id) {
-                    return Some(TrayAction::Quit);
-                }
-                for (pid, name) in &guard.profile_ids {
-                    if pid == &ev.id {
-                        return Some(TrayAction::ApplyProfile(name.clone()));
+    fn resolve_raw(&self, raw: RawTrayEvent) -> Option<TrayAction> {
+        match raw {
+            RawTrayEvent::Menu(id) => {
+                if let Ok(guard) = self.ids.lock() {
+                    if guard.show_id.as_ref() == Some(&id) {
+                        return Some(TrayAction::ShowWindow);
+                    }
+                    if guard.hide_id.as_ref() == Some(&id) {
+                        return Some(TrayAction::HideWindow);
+                    }
+                    if guard.toggle_id.as_ref() == Some(&id) {
+                        return Some(TrayAction::ToggleSwitcher);
+                    }
+                    if guard.flash_id.as_ref() == Some(&id) {
+                        return Some(TrayAction::CommitToFlash);
+                    }
+                    if guard.quit_id.as_ref() == Some(&id) {
+                        return Some(TrayAction::Quit);
+                    }
+                    for (pid, name) in &guard.profile_ids {
+                        if pid == &id {
+                            return Some(TrayAction::ApplyProfile(name.clone()));
+                        }
                     }
                 }
+                None
             }
+            RawTrayEvent::Click => Some(TrayAction::ShowWindow),
         }
-        if let Ok(ev) = TrayIconEvent::receiver().try_recv() {
-            if matches!(
-                ev,
-                TrayIconEvent::Click { .. } | TrayIconEvent::DoubleClick { .. }
-            ) {
-                return Some(TrayAction::ShowWindow);
-            }
+    }
+
+    pub fn poll_event(&self) -> Option<TrayAction> {
+        let q = tray_queue();
+        let raw = q.events.lock().ok().and_then(|mut g| g.pop_front())?;
+        self.resolve_raw(raw)
+    }
+
+    pub fn wait_action(&self, timeout: Duration) -> Option<TrayAction> {
+        let q = tray_queue();
+        let mut guard = q.events.lock().ok()?;
+        if guard.is_empty() {
+            let (g, _) = q.wake.wait_timeout(guard, timeout).ok()?;
+            guard = g;
         }
-        None
+        let raw = guard.pop_front()?;
+        drop(guard);
+        self.resolve_raw(raw)
     }
 }

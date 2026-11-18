@@ -9,18 +9,35 @@ mod ui;
 mod widgets;
 
 use app::OpenMadApp;
+use i18n::Lang;
 use iced::Size;
 use icon::generate_app_icon_rgba;
 use openmad_core::device::Mad68;
 use openmad_core::devices::UnlockedBoards;
-use openmad_core::paths::{profile_dir, settings_path, unlocked_boards_path};
+use openmad_core::paths::{profile_dir, settings_path, switcher_config_path, unlocked_boards_path};
 use openmad_core::profile::{list_profiles, profile_path, Profile};
 use openmad_core::protocol::FlashOp;
+use openmad_core::sampler::{DeviceCommand, SamplerHandle};
 use openmad_core::settings::AppSettings;
+use openmad_core::switcher::SwitcherConfig;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::Duration;
 use theme::{
     app_theme, FONT_INTER, INTER_MEDIUM_BYTES, INTER_REGULAR_BYTES, INTER_SEMIBOLD_BYTES,
     LUCIDE_FONT_BYTES,
 };
+use tray::{TrayAction, TrayHandle, TrayMenuState};
+
+static RELAUNCH_MINIMIZED: AtomicBool = AtomicBool::new(false);
+static RELAUNCH_PROFILE: Mutex<Option<String>> = Mutex::new(None);
+
+pub fn request_relaunch_minimized(active_profile: Option<&str>) {
+    if let Ok(mut g) = RELAUNCH_PROFILE.lock() {
+        *g = active_profile.map(str::to_string);
+    }
+    RELAUNCH_MINIMIZED.store(true, Ordering::SeqCst);
+}
 
 pub fn load_window_icon() -> Option<iced::window::Icon> {
     let rgba = generate_app_icon_rgba(256);
@@ -42,20 +59,19 @@ fn install_linux_desktop_entry() {
     let icon_path_legacy = icon_dir.join("openmad.png");
     let icon_path = icon_dir.join("openmad-rust.png");
     let mut updated = false;
-    let rgba = generate_app_icon_rgba(256);
-    if let Some(buf) = image::RgbaImage::from_raw(256, 256, rgba) {
-        let mut png_bytes = Vec::new();
-        if image::DynamicImage::ImageRgba8(buf)
-            .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
-            .is_ok()
-        {
-            let _ = std::fs::create_dir_all(&icon_dir);
-            for target in [&icon_path, &icon_path_legacy] {
-                let needs_icon = std::fs::read(target)
-                    .map(|cur| cur != png_bytes)
-                    .unwrap_or(true);
-                if needs_icon && std::fs::write(target, &png_bytes).is_ok() {
-                    updated = true;
+    if !icon_path.exists() || !icon_path_legacy.exists() {
+        let rgba = generate_app_icon_rgba(256);
+        if let Some(buf) = image::RgbaImage::from_raw(256, 256, rgba) {
+            let mut png_bytes = Vec::new();
+            if image::DynamicImage::ImageRgba8(buf)
+                .write_to(&mut std::io::Cursor::new(&mut png_bytes), image::ImageFormat::Png)
+                .is_ok()
+            {
+                let _ = std::fs::create_dir_all(&icon_dir);
+                for target in [&icon_path, &icon_path_legacy] {
+                    if !target.exists() && std::fs::write(target, &png_bytes).is_ok() {
+                        updated = true;
+                    }
                 }
             }
         }
@@ -184,6 +200,136 @@ fn try_cli_command() -> Option<i32> {
     None
 }
 
+fn relaunch_self(minimized: bool, active_profile: Option<&str>) {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let mut cmd = std::process::Command::new(exe);
+    if minimized {
+        cmd.arg("--minimized");
+    }
+    if let Some(p) = active_profile {
+        cmd.env("OPENMAD_ACTIVE_PROFILE", p);
+    } else {
+        cmd.env_remove("OPENMAD_ACTIVE_PROFILE");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        let _ = cmd.exec();
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cmd.spawn();
+        std::process::exit(0);
+    }
+}
+
+/// Pure headless tray + driver + app-switcher daemon for `--minimized`.
+/// Avoids initializing `iced`, `wgpu`, Vulkan/Mesa GPU drivers, fonts, and the async executor.
+fn run_tray_daemon() {
+    let profiles = list_profiles(&profile_dir());
+    let settings = AppSettings::load(&settings_path());
+    let lang = Lang::from_code(&settings.language);
+    let mut switcher_cfg = SwitcherConfig::load(&switcher_config_path());
+    let mut active_profile = std::env::var("OPENMAD_ACTIVE_PROFILE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| profiles.first().cloned());
+
+    let mut sampler = SamplerHandle::start_with_options(false, false);
+    let tray = TrayHandle::new(TrayMenuState {
+        profiles: profiles.clone(),
+        active_profile: active_profile.clone(),
+        switcher_enabled: switcher_cfg.enabled,
+        is_pt: lang.is_pt(),
+    });
+    let mut last_seq: u64 = 0;
+
+    loop {
+        #[cfg(target_os = "windows")]
+        openmad_core::switcher::pump_win32_messages();
+
+        let action = if let Some(ref tr) = tray {
+            let wait = if cfg!(target_os = "windows") {
+                Duration::from_millis(120)
+            } else {
+                Duration::from_millis(500)
+            };
+            tr.wait_action(wait)
+        } else {
+            std::thread::sleep(Duration::from_millis(500));
+            None
+        };
+
+        if let Some(act) = action {
+            match act {
+                TrayAction::ShowWindow => {
+                    drop(tray);
+                    sampler.stop_and_join();
+                    relaunch_self(false, active_profile.as_deref());
+                    return;
+                }
+                TrayAction::HideWindow => {}
+                TrayAction::ToggleSwitcher => {
+                    switcher_cfg.enabled = !switcher_cfg.enabled;
+                    let _ = switcher_cfg.save(&switcher_config_path());
+                    sampler.send(DeviceCommand::ReloadSwitcher);
+                    if let Some(ref tr) = tray {
+                        tr.update_state(TrayMenuState {
+                            profiles: profiles.clone(),
+                            active_profile: active_profile.clone(),
+                            switcher_enabled: switcher_cfg.enabled,
+                            is_pt: lang.is_pt(),
+                        });
+                    }
+                }
+                TrayAction::CommitToFlash => {
+                    sampler.send(DeviceCommand::CommitToFlash);
+                }
+                TrayAction::ApplyProfile(name) => {
+                    active_profile = Some(name.clone());
+                    sampler.send(DeviceCommand::ApplyProfile {
+                        name,
+                        flash_op: FlashOp::Normal,
+                    });
+                    if let Some(ref tr) = tray {
+                        tr.update_state(TrayMenuState {
+                            profiles: profiles.clone(),
+                            active_profile: active_profile.clone(),
+                            switcher_enabled: switcher_cfg.enabled,
+                            is_pt: lang.is_pt(),
+                        });
+                    }
+                }
+                TrayAction::Quit => {
+                    drop(tray);
+                    sampler.stop_and_join();
+                    return;
+                }
+            }
+        }
+
+        let (seq, samp_active) = sampler.read_tray_summary();
+        if seq != last_seq {
+            last_seq = seq;
+            if let Some(prof) = samp_active {
+                if active_profile.as_deref() != Some(prof.as_str()) {
+                    active_profile = Some(prof);
+                    if let Some(ref tr) = tray {
+                        tr.update_state(TrayMenuState {
+                            profiles: profiles.clone(),
+                            active_profile: active_profile.clone(),
+                            switcher_enabled: switcher_cfg.enabled,
+                            is_pt: lang.is_pt(),
+                        });
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn main() -> iced::Result {
     if let Some(code) = try_cli_command() {
         std::process::exit(code);
@@ -192,7 +338,14 @@ fn main() -> iced::Result {
     #[cfg(target_os = "linux")]
     install_linux_desktop_entry();
 
-    iced::daemon(OpenMadApp::title, OpenMadApp::update, OpenMadApp::view)
+    let start_minimized = std::env::args().any(|a| a == "--minimized" || a == "--tray");
+    let has_screenshot = std::env::args().any(|a| a.starts_with("--screenshot="));
+    if start_minimized && !has_screenshot {
+        run_tray_daemon();
+        return Ok(());
+    }
+
+    let res = iced::daemon(OpenMadApp::title, OpenMadApp::update, OpenMadApp::view)
         .font(INTER_REGULAR_BYTES)
         .font(INTER_MEDIUM_BYTES)
         .font(INTER_SEMIBOLD_BYTES)
@@ -200,5 +353,12 @@ fn main() -> iced::Result {
         .default_font(FONT_INTER)
         .theme(|_, _| app_theme())
         .subscription(OpenMadApp::subscription)
-        .run_with(OpenMadApp::new)
+        .run_with(OpenMadApp::new);
+
+    if RELAUNCH_MINIMIZED.swap(false, Ordering::SeqCst) {
+        let prof = RELAUNCH_PROFILE.lock().ok().and_then(|mut g| g.take());
+        relaunch_self(true, prof.as_deref());
+    }
+
+    res
 }

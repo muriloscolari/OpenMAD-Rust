@@ -6,14 +6,14 @@ use crate::theme::{
     primary_button_style, secondary_button_style, toggler_style, type_scale, FONT_MEDIUM,
     FONT_SEMIBOLD, RED_DANGER, SP_MD, SP_SM, TEXT_MUTED, TEXT_PRIMARY, TEXT_SECONDARY,
 };
-use crate::ui::components::{badge, card, empty_state};
+use crate::ui::components::{badge, card, empty_state, segmented};
 use crate::ui::icons::{icon, Icon};
 use iced::widget::{
     button, column, container, pick_list, row, scrollable, text, text_input, toggler, Column, Row,
     Space,
 };
 use iced::{Alignment, Color, Element, Length};
-use openmad_core::switcher::watcher_backend_name;
+use openmad_core::switcher::{watcher_backend_name, FallbackMode};
 
 impl OpenMadApp {
     pub fn view_app_trigger_page(&self, accent: Color) -> Element<'_, Message> {
@@ -56,7 +56,7 @@ impl OpenMadApp {
                 .size(type_scale::CAPTION + 1)
                 .style(input_style(accent)),
             Space::with_width(Length::Fill),
-            text(l.t("Perfil Padrão (Fallback):", "Default Fallback:"))
+            text(l.t("Perfil Padrão:", "Default Profile:"))
                 .size(type_scale::BODY)
                 .color(TEXT_SECONDARY),
             pick_list(prof_choices, Some(cur_default), Message::SetDefaultProfile)
@@ -65,6 +65,44 @@ impl OpenMadApp {
         ]
         .spacing(SP_SM)
         .align_y(Alignment::Center);
+
+        let fallback_modes = [
+            (
+                FallbackMode::OnClose,
+                l.t("Ao fechar o jogo/app", "When app closes"),
+            ),
+            (
+                FallbackMode::OnUnfocus,
+                l.t("Ao perder o foco", "On unfocus"),
+            ),
+            (FallbackMode::Disabled, l.t("Desativado", "Disabled")),
+        ];
+        let mut fallback_row = row![
+            text(l.t("Voltar ao Padrão:", "Revert to Default:"))
+                .size(type_scale::CAPTION + 1)
+                .color(TEXT_SECONDARY),
+            segmented(
+                &fallback_modes,
+                self.switcher_cfg.fallback_mode,
+                accent,
+                Message::SetFallbackMode,
+            ),
+        ]
+        .spacing(SP_SM)
+        .align_y(Alignment::Center);
+
+        if self.switcher_cfg.fallback_mode != FallbackMode::Disabled
+            && self.switcher_cfg.default_profile.is_none()
+        {
+            fallback_row = fallback_row.push(
+                text(l.t(
+                    "Defina um Perfil Padrão acima.",
+                    "Pick a Default Profile above.",
+                ))
+                .size(type_scale::CAPTION)
+                .color(crate::theme::AMBER_WARN),
+            );
+        }
 
         let status_body = column![
             row![
@@ -86,6 +124,7 @@ impl OpenMadApp {
             .spacing(SP_SM)
             .align_y(Alignment::Center),
             timing_row,
+            fallback_row,
         ]
         .spacing(SP_SM);
 

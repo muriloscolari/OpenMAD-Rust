@@ -23,7 +23,7 @@ use openmad_core::protocol::{AdvancedKeyMode, FlashOp, BRIGHTNESS_MAX};
 use openmad_core::sampler::{DeviceCommand, SamplerHandle, Snapshot};
 use openmad_core::settings::{set_start_at_login, AppSettings};
 use openmad_core::switcher::{
-    list_windowed_processes, Rule, SwitcherConfig, WindowedProcess,
+    list_windowed_processes, FallbackMode, Rule, SwitcherConfig, WindowedProcess,
 };
 use openmad_core::updater::{
     check_for_update, download_and_apply_update, UpdateInfo, REPO_SLUG,
@@ -245,6 +245,7 @@ pub enum Message {
 
     // App Trigger
     ToggleAutoSwitcher(bool),
+    SetFallbackMode(FallbackMode),
     TriggerExeChanged(String),
     TriggerTitleChanged(String),
     BrowseTriggerExe,
@@ -399,7 +400,10 @@ impl OpenMadApp {
         let settings = AppSettings::load(&settings_path());
         let lang = Lang::from_code(&settings.language);
         let switcher_cfg = SwitcherConfig::load(&switcher_config_path());
-        let selected_profile = profiles.first().cloned();
+        let selected_profile = std::env::var("OPENMAD_ACTIVE_PROFILE")
+            .ok()
+            .filter(|s| !s.is_empty() && profiles.contains(s))
+            .or_else(|| profiles.first().cloned());
         let tray = TrayHandle::new(TrayMenuState {
             profiles: profiles.clone(),
             active_profile: selected_profile.clone(),
@@ -407,15 +411,19 @@ impl OpenMadApp {
             is_pt: lang.is_pt(),
         });
         let snap = sampler.read_snapshot();
-        let processes = list_windowed_processes();
+        let processes = Vec::new();
 
         let start_minimized = std::env::args().any(|a| a == "--minimized" || a == "--tray");
         let screenshot_target = std::env::args()
             .find_map(|a| a.strip_prefix("--screenshot=").map(|s| s.to_string()));
         let (window_id, init_task) = if start_minimized && screenshot_target.is_none() {
+            sampler.set_ui_open(false);
+            sampler.set_telemetry_active(false);
             (None, Task::none())
         } else {
             let (win_id, open_task) = window::open(crate::window_settings());
+            sampler.set_ui_open(true);
+            sampler.set_telemetry_active(true);
             (Some(win_id), open_task.discard())
         };
 
@@ -521,8 +529,15 @@ impl OpenMadApp {
     }
 
     pub fn subscription(&self) -> Subscription<Message> {
+        let fast_tick = self.window_id.is_some()
+            && (self.section == NavSection::Performance
+                || self.toast.is_some()
+                || self.macro_recording
+                || self.diag_running
+                || self.screenshot_target.is_some());
+        let tick_ms = if fast_tick { 33 } else { 200 };
         let mut subs = vec![
-            time::every(Duration::from_millis(33)).map(|_| Message::Tick),
+            time::every(Duration::from_millis(tick_ms)).map(|_| Message::Tick),
             window::close_requests().map(Message::WindowCloseRequested),
             window::events().map(|(id, ev)| Message::WindowEvent(id, ev)),
         ];
@@ -537,20 +552,31 @@ impl OpenMadApp {
 
     fn show_window_task(&mut self) -> Task<Message> {
         if let Some(id) = self.window_id {
+            self.sync_focus_polling();
             Task::batch([window::minimize(id, false), window::gain_focus(id)])
         } else {
             let (id, open_task) = window::open(crate::window_settings());
             self.window_id = Some(id);
+            self.sync_focus_polling();
             open_task.discard()
         }
     }
 
     fn hide_window_task(&mut self) -> Task<Message> {
-        if let Some(id) = self.window_id.take() {
-            window::close(id)
-        } else {
-            Task::none()
+        let prev_id = self.window_id.take();
+        self.sampler.set_ui_open(false);
+        self.sampler.set_telemetry_active(false);
+        self.sampler.set_fg_watch_ui(false);
+        if self.tray.is_some() && self.screenshot_target.is_none() {
+            crate::request_relaunch_minimized(self.selected_profile.as_deref());
+            self.tray.take();
+            self.sampler.stop_and_join();
+            return iced::exit();
         }
+        if let Some(id) = prev_id {
+            return window::close(id);
+        }
+        Task::none()
     }
 
     fn sync_tray_state(&self) {
@@ -565,7 +591,14 @@ impl OpenMadApp {
     }
 
     fn sync_focus_polling(&self) {
-        if self.section == NavSection::Performance && self.perf_sub == PerfSubTab::Travel {
+        let open = self.window_id.is_some();
+        self.sampler.set_ui_open(open);
+        self.sampler
+            .set_telemetry_active(open && self.section == NavSection::Performance);
+        self.sampler
+            .set_fg_watch_ui(open && self.section == NavSection::AppTrigger);
+
+        if open && self.section == NavSection::Performance && self.perf_sub == PerfSubTab::Travel {
             let cols = self.snap.board.cols.max(1);
             let idx = self
                 .selected_keys
@@ -578,8 +611,9 @@ impl OpenMadApp {
         } else {
             self.sampler.send(DeviceCommand::SetFocusKey(None));
         }
-        let poll_adc =
-            self.section == NavSection::Performance && self.perf_sub == PerfSubTab::Calibration;
+        let poll_adc = open
+            && self.section == NavSection::Performance
+            && self.perf_sub == PerfSubTab::Calibration;
         self.sampler.send(DeviceCommand::SetPollAdc(poll_adc));
     }
 
@@ -895,24 +929,24 @@ impl OpenMadApp {
                 self.sampler.stop();
                 return iced::exit();
             }
-            Message::WindowCloseRequested(id) => {
+            Message::WindowCloseRequested(_id) => {
                 if self.settings.close_to_tray {
-                    if self.window_id == Some(id) {
-                        self.window_id = None;
-                    }
-                    return window::close(id);
+                    return self.hide_window_task();
                 } else {
-                    self.sampler.stop();
+                    self.tray.take();
+                    self.sampler.stop_and_join();
                     return iced::exit();
                 }
             }
             Message::WindowEvent(id, ev) => match ev {
                 window::Event::Opened { .. } => {
                     self.window_id = Some(id);
+                    self.sync_focus_polling();
                 }
                 window::Event::Closed => {
                     if self.window_id == Some(id) {
                         self.window_id = None;
+                        self.sync_focus_polling();
                     }
                 }
                 window::Event::Unfocused if self.settings.close_to_tray => {
@@ -921,11 +955,8 @@ impl OpenMadApp {
                 }
                 _ => {}
             },
-            Message::CheckMinimized(id, Some(true)) => {
-                if self.window_id == Some(id) {
-                    self.window_id = None;
-                }
-                return window::close(id);
+            Message::CheckMinimized(_id, Some(true)) => {
+                return self.hide_window_task();
             }
             Message::CheckMinimized(_, _) => {}
             Message::HideToTray => return self.hide_window_task(),
@@ -1798,6 +1829,35 @@ impl OpenMadApp {
                 let _ = self.switcher_cfg.save(&switcher_config_path());
                 self.sampler.send(DeviceCommand::ReloadSwitcher);
                 self.sync_tray_state();
+            }
+            Message::SetFallbackMode(mode) => {
+                self.switcher_cfg.fallback_mode = mode;
+                if mode != FallbackMode::Disabled && self.switcher_cfg.default_profile.is_none() {
+                    if let Some(p) = self
+                        .profiles
+                        .iter()
+                        .find(|p| p.eq_ignore_ascii_case("Padrão") || p.eq_ignore_ascii_case("Default"))
+                    {
+                        self.switcher_cfg.default_profile = Some(p.clone());
+                    }
+                }
+                let _ = self.switcher_cfg.save(&switcher_config_path());
+                self.sampler.send(DeviceCommand::ReloadSwitcher);
+                let msg = match mode {
+                    FallbackMode::OnClose => self.lang.t(
+                        "Voltará ao perfil padrão ao fechar o jogo/app",
+                        "Will revert to default profile when app closes",
+                    ),
+                    FallbackMode::OnUnfocus => self.lang.t(
+                        "Voltará ao perfil padrão ao trocar de janela",
+                        "Will revert to default profile on focus change",
+                    ),
+                    FallbackMode::Disabled => self.lang.t(
+                        "Retorno automático ao perfil padrão desativado",
+                        "Automatic fallback to default profile disabled",
+                    ),
+                };
+                self.show_toast(msg, false);
             }
             Message::TriggerExeChanged(s) => self.trigger_exe = s,
             Message::TriggerTitleChanged(s) => self.trigger_title = s,
